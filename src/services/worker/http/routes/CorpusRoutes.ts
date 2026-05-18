@@ -133,7 +133,7 @@ export class CorpusRoutes extends BaseRouteHandler {
    * GET /api/corpus/:name
    */
   private handleGetCorpus = this.wrapHandler((req: Request, res: Response): void => {
-    const { name } = req.params;
+    const name = req.params['name'] as string;
     const corpus = this.corpusStore.read(name);
 
     if (!corpus) {
@@ -155,7 +155,7 @@ export class CorpusRoutes extends BaseRouteHandler {
    * DELETE /api/corpus/:name
    */
   private handleDeleteCorpus = this.wrapHandler((req: Request, res: Response): void => {
-    const { name } = req.params;
+    const name = req.params['name'] as string;
     const existed = this.corpusStore.delete(name);
 
     if (!existed) {
@@ -175,7 +175,7 @@ export class CorpusRoutes extends BaseRouteHandler {
    * POST /api/corpus/:name/rebuild
    */
   private handleRebuildCorpus = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
-    const { name } = req.params;
+    const name = req.params['name'] as string;
     const existingCorpus = this.corpusStore.read(name);
 
     if (!existingCorpus) {
@@ -199,7 +199,7 @@ export class CorpusRoutes extends BaseRouteHandler {
    * POST /api/corpus/:name/prime
    */
   private handlePrimeCorpus = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
-    const { name } = req.params;
+    const name = req.params['name'] as string;
     const corpus = this.corpusStore.read(name);
 
     if (!corpus) {
@@ -221,7 +221,7 @@ export class CorpusRoutes extends BaseRouteHandler {
    * Body: { question: string }
    */
   private handleQueryCorpus = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
-    const { name } = req.params;
+    const name = req.params['name'] as string;
     const corpus = this.corpusStore.read(name);
 
     if (!corpus) {
@@ -243,7 +243,7 @@ export class CorpusRoutes extends BaseRouteHandler {
    * POST /api/corpus/:name/reprime
    */
   private handleReprimeCorpus = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
-    const { name } = req.params;
+    const name = req.params['name'] as string;
     const corpus = this.corpusStore.read(name);
 
     if (!corpus) {

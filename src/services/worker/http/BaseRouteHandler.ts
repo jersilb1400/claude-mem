@@ -39,7 +39,8 @@ export abstract class BaseRouteHandler {
    * Returns the integer value or sends 400 error response
    */
   protected parseIntParam(req: Request, res: Response, paramName: string): number | null {
-    const value = parseInt(req.params[paramName], 10);
+    const raw = req.params[paramName];
+    const value = parseInt(Array.isArray(raw) ? raw[0] : raw, 10);
     if (isNaN(value)) {
       this.badRequest(res, `Invalid ${paramName}`);
       return null;
