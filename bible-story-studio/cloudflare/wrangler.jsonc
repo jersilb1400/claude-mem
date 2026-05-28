@@ -1,0 +1,31 @@
+{
+  // Deploy the autonomous control plane to Cloudflare.
+  //   npm i -D wrangler @cloudflare/workers-types
+  //   npx wrangler deploy
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "bible-story-studio",
+  "main": "worker.ts",
+  "compatibility_date": "2026-05-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // Durable, checkpointed orchestration.
+  "workflows": [
+    {
+      "name": "studio-workflow",
+      "binding": "STUDIO_WORKFLOW",
+      "class_name": "StudioWorkflow"
+    }
+  ],
+
+  // Artifact storage (S3-compatible). Mirrors src/storage.ts.
+  "r2_buckets": [{ "binding": "ARTIFACTS", "bucket_name": "bible-story-artifacts" }],
+
+  // One autonomous episode per day at 15:00 UTC.
+  "triggers": { "crons": ["0 15 * * *"] },
+
+  // Secrets — set with `npx wrangler secret put <NAME>` (do NOT commit values):
+  //   OPENROUTER_API_KEY, FAL_API_KEY, ELEVENLABS_API_KEY,
+  //   RENDER_ENDPOINT, RENDER_TOKEN,
+  //   YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET, YOUTUBE_REFRESH_TOKEN
+  "vars": {}
+}
