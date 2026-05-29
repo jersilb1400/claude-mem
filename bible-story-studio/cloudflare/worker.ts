@@ -59,6 +59,8 @@ export interface Env {
   PROMOTE_AFTER_HOURS?: string;
   // Optional: Discord webhook URL for notifications
   DISCORD_WEBHOOK?: string;
+  // Optional: YouTube Data API v3 public key for read-only analytics (separate from OAuth)
+  YOUTUBE_API_KEY?: string;
 }
 
 interface Params {
@@ -366,6 +368,48 @@ async function autoPromote(env: Env): Promise<void> {
         `❌ Failed to promote episode ${row.id}: ${String(err)}`,
         0xed4245,
       );
+    }
+  }
+}
+
+/**
+ * Feature: Analytics — fetch YouTube statistics and store in analytics table.
+ * Runs on the 0 10 * * * cron. Requires YOUTUBE_API_KEY env var.
+ */
+async function fetchAnalytics(env: Env): Promise<void> {
+  if (!env.YOUTUBE_API_KEY) return; // skip if no API key configured
+
+  const rows = await env.SERIES_MEMORY
+    .prepare("SELECT id, youtube_id FROM episodes WHERE status='published' AND youtube_id IS NOT NULL")
+    .all<{ id: string; youtube_id: string }>();
+
+  for (const row of rows.results) {
+    try {
+      const res = await fetch(
+        `https://www.googleapis.com/youtube/v3/videos?part=statistics&id=${encodeURIComponent(row.youtube_id)}&key=${encodeURIComponent(env.YOUTUBE_API_KEY)}`,
+      );
+      if (!res.ok) continue;
+      const data = (await res.json()) as {
+        items?: Array<{ statistics?: { viewCount?: string; likeCount?: string; commentCount?: string } }>;
+      };
+      const stats = data.items?.[0]?.statistics;
+      if (!stats) continue;
+
+      await env.SERIES_MEMORY
+        .prepare(
+          "INSERT INTO analytics (episode_id, youtube_id, views, likes, comments) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(
+          row.id,
+          row.youtube_id,
+          parseInt(stats.viewCount ?? "0", 10),
+          parseInt(stats.likeCount ?? "0", 10),
+          parseInt(stats.commentCount ?? "0", 10),
+        )
+        .run()
+        .catch(() => {});
+    } catch {
+      // never fail the cron
     }
   }
 }
@@ -987,6 +1031,12 @@ export default {
       return;
     }
 
+    if (controller.cron === "0 10 * * *") {
+      // Feature: YouTube Analytics fetch
+      await fetchAnalytics(env);
+      return;
+    }
+
     // Default: 0 15 * * * — daily episode
     await env.STUDIO_WORKFLOW.create({ params: {} });
 
@@ -1096,6 +1146,133 @@ export default {
       }
     }
 
+    // Feature 1: GET /thumbnail/:id — proxy R2 thumbnail with caching headers
+    if (req.method === "GET" && url.pathname.startsWith("/thumbnail/")) {
+      const epId = url.pathname.slice("/thumbnail/".length);
+      const key = `${epId}/thumbnail.jpg`;
+      const obj = await env.ARTIFACTS.get(key);
+      if (!obj) return new Response("Not found", { status: 404, headers: corsHeaders() });
+      const headers = new Headers({
+        "Content-Type": "image/jpeg",
+        "Cache-Control": "public, max-age=86400",
+        ...corsHeaders(),
+      });
+      return new Response(obj.body, { status: 200, headers });
+    }
+
+    // Feature 2: GET /characters — character library
+    if (req.method === "GET" && url.pathname === "/characters") {
+      const rows = await env.SERIES_MEMORY
+        .prepare(
+          "SELECT id, name, description, palette_skin, palette_hair, palette_robe, reference_sheet_key, created_at FROM characters ORDER BY name ASC",
+        )
+        .all();
+      return jsonResponse(rows.results);
+    }
+
+    // Feature 3: GET /analytics — latest analytics per episode
+    if (req.method === "GET" && url.pathname === "/analytics") {
+      const rows = await env.SERIES_MEMORY
+        .prepare(
+          `SELECT a.episode_id, a.youtube_id, e.title, a.views, a.likes, a.comments, a.fetched_at
+           FROM analytics a
+           JOIN episodes e ON e.id = a.episode_id
+           WHERE a.id IN (
+             SELECT MAX(id) FROM analytics GROUP BY episode_id
+           )
+           ORDER BY a.views DESC
+           LIMIT 50`,
+        )
+        .all();
+      return jsonResponse(rows.results);
+    }
+
+    // Feature 3: GET /analytics/:episodeId — analytics history for one episode
+    if (req.method === "GET" && url.pathname.startsWith("/analytics/")) {
+      const epId = url.pathname.slice("/analytics/".length);
+      const rows = await env.SERIES_MEMORY
+        .prepare(
+          "SELECT id, episode_id, youtube_id, views, likes, comments, fetched_at FROM analytics WHERE episode_id = ? ORDER BY fetched_at ASC",
+        )
+        .bind(epId)
+        .all();
+      return jsonResponse(rows.results);
+    }
+
+    // Feature 4: POST /retry/:id — re-trigger workflow for any episode
+    if (req.method === "POST" && url.pathname.startsWith("/retry/")) {
+      const auth = req.headers.get("Authorization");
+      if (!auth || auth !== `Bearer ${env.RENDER_TOKEN}`) {
+        return new Response("Unauthorized", { status: 401, headers: corsHeaders() });
+      }
+      const epId = url.pathname.slice("/retry/".length);
+      const row = await env.SERIES_MEMORY
+        .prepare("SELECT topic, status FROM episodes WHERE id = ?")
+        .bind(epId)
+        .first<{ topic: string; status: string }>();
+      if (!row) return new Response("Episode not found", { status: 404, headers: corsHeaders() });
+      const instance = await env.STUDIO_WORKFLOW.create({ params: { topic: row.topic } });
+      return jsonResponse({ newInstanceId: instance.id, topic: row.topic, originalId: epId });
+    }
+
+    // Feature 5: GET /feed.xml — RSS 2.0 podcast feed
+    if (req.method === "GET" && url.pathname === "/feed.xml") {
+      const rows = await env.SERIES_MEMORY
+        .prepare(
+          "SELECT title, lesson, youtube_url, published_at FROM episodes WHERE status='published' AND youtube_url IS NOT NULL ORDER BY published_at DESC LIMIT 50",
+        )
+        .all<{ title: string; lesson: string | null; youtube_url: string; published_at: number | null }>();
+
+      function toRfc822(unixTs: number | null): string {
+        if (!unixTs) return new Date().toUTCString();
+        return new Date(unixTs * 1000).toUTCString();
+      }
+
+      function escapeXml(s: string): string {
+        return s
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;")
+          .replace(/'/g, "&apos;");
+      }
+
+      const items = rows.results
+        .map(
+          (ep) => `    <item>
+      <title>${escapeXml(ep.title)}</title>
+      <link>${escapeXml(ep.youtube_url)}</link>
+      <guid isPermaLink="true">${escapeXml(ep.youtube_url)}</guid>
+      <description>${escapeXml(ep.lesson ?? "")}</description>
+      <pubDate>${toRfc822(ep.published_at)}</pubDate>
+      <itunes:duration>180</itunes:duration>
+    </item>`,
+        )
+        .join("\n");
+
+      const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">
+  <channel>
+    <title>Bible Videos for Kids</title>
+    <link>https://www.youtube.com/@BibleVideosForKids</link>
+    <description>Gentle animated Bible stories for children ages 3-8</description>
+    <language>en-us</language>
+    <itunes:category text="Kids &amp; Family" />
+    <itunes:explicit>false</itunes:explicit>
+    <itunes:author>Bible Videos for Kids</itunes:author>
+${items}
+  </channel>
+</rss>`;
+
+      return new Response(xml, {
+        status: 200,
+        headers: {
+          "Content-Type": "application/rss+xml; charset=utf-8",
+          ...corsHeaders(),
+        },
+      });
+    }
+
     // Feature 6: GET /costs/:episodeId
     if (req.method === "GET" && url.pathname.startsWith("/costs/") && url.pathname !== "/costs/summary") {
       const epId = url.pathname.slice("/costs/".length);
@@ -1127,9 +1304,15 @@ export default {
           "GET   /episodes            recent episodes",
           "GET   /status/:id          episode details",
           "POST  /approve/:id         publish held episode [Bearer]",
+          "POST  /retry/:id           re-trigger workflow for any episode [Bearer]",
           "POST  /topics/generate     auto-generate topics [Bearer]",
           "GET   /costs/:episodeId    cost breakdown for episode",
           "GET   /costs/summary       monthly cost summary",
+          "GET   /thumbnail/:id       episode thumbnail (image/jpeg, R2-proxied)",
+          "GET   /characters          character library",
+          "GET   /analytics           latest YouTube analytics per episode",
+          "GET   /analytics/:id       analytics history for one episode",
+          "GET   /feed.xml            RSS 2.0 feed of published episodes",
         ].join("\n"),
         { status: 200, headers: { "Content-Type": "text/plain" } },
       ),

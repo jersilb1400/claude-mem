@@ -39,7 +39,7 @@
   //   0 15 * * *  — one autonomous episode per day
   //   0 16 * * *  — daily YouTube Short (1h after main episode)
   //   0 20 * * *  — auto-promote unlisted episodes to public
-  "triggers": { "crons": ["0 15 * * *", "0 16 * * *", "0 20 * * *"] },
+  "triggers": { "crons": ["0 15 * * *", "0 16 * * *", "0 20 * * *", "0 10 * * *"] },
 
   // Secrets — set with `npx wrangler secret put <NAME>` (never commit values):
   //   OPENROUTER_API_KEY   — Nous Hermes story + Llama metadata/safety
@@ -52,5 +52,6 @@
   //   YOUTUBE_REFRESH_TOKEN
   //   DISCORD_WEBHOOK      — optional: Discord webhook URL for notifications
   //   PROMOTE_AFTER_HOURS  — optional: hours before unlisted→public (default 24)
+  //   YOUTUBE_API_KEY      — optional: YouTube Data API v3 key for analytics fetch (read-only, no OAuth)
   "vars": {}
 }

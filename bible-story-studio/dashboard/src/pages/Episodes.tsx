@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
-import { fetchEpisodes, approveEpisode } from "../api.js";
+import { fetchEpisodes, approveEpisode, retryEpisode, thumbnailUrl } from "../api.js";
 import type { Episode } from "../types.js";
 
 const STATUS_COLORS: Record<string, string> = {
@@ -28,7 +28,13 @@ function StatusBadge({ status }: { status: string }) {
 
 function EpisodeCard({ episode, onApproved }: { episode: Episode; onApproved: () => void }) {
   const [approving, setApproving] = useState(false);
+  const [retrying, setRetrying] = useState(false);
+  const [imgLoaded, setImgLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const workerUrl = localStorage.getItem("WORKER_URL") ?? "";
+  const token = localStorage.getItem("RENDER_TOKEN") ?? "";
+  const thumbSrc = thumbnailUrl(workerUrl, episode.id);
 
   async function handleApprove() {
     setApproving(true);
@@ -43,6 +49,19 @@ function EpisodeCard({ episode, onApproved }: { episode: Episode; onApproved: ()
     }
   }
 
+  async function handleRetry() {
+    setRetrying(true);
+    setError(null);
+    try {
+      await retryEpisode(workerUrl, token, episode.id);
+      onApproved(); // refresh list
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setRetrying(false);
+    }
+  }
+
   const created = new Date(episode.created_at * 1000).toLocaleDateString(undefined, {
     month: "short",
     day: "numeric",
@@ -50,48 +69,73 @@ function EpisodeCard({ episode, onApproved }: { episode: Episode; onApproved: ()
   });
 
   return (
-    <div className="rounded-xl bg-surface-800 p-4 shadow">
-      <div className="mb-2 flex items-start justify-between gap-2">
-        <div className="flex-1 min-w-0">
-          <p className="truncate font-semibold text-sm">{episode.title}</p>
-          {episode.source && (
-            <p className="text-xs text-gray-400 mt-0.5">{episode.source}</p>
-          )}
-        </div>
-        <StatusBadge status={episode.status} />
+    <div className="rounded-xl bg-surface-800 shadow overflow-hidden">
+      {/* Thumbnail */}
+      <div className="relative w-full h-36 bg-surface-700">
+        {!imgLoaded && (
+          <div className="absolute inset-0 animate-pulse bg-surface-700 rounded-t-xl" />
+        )}
+        <img
+          src={thumbSrc}
+          alt={episode.title}
+          loading="lazy"
+          onLoad={() => setImgLoaded(true)}
+          onError={() => setImgLoaded(true)}
+          className={`w-full h-full object-cover transition-opacity duration-300 ${imgLoaded ? "opacity-100" : "opacity-0"}`}
+        />
       </div>
 
-      {episode.lesson && (
-        <p className="mb-3 text-xs text-gray-400 line-clamp-2">{episode.lesson}</p>
-      )}
+      <div className="p-4">
+        <div className="mb-2 flex items-start justify-between gap-2">
+          <div className="flex-1 min-w-0">
+            <p className="truncate font-semibold text-sm">{episode.title}</p>
+            {episode.source && (
+              <p className="text-xs text-gray-400 mt-0.5">{episode.source}</p>
+            )}
+          </div>
+          <StatusBadge status={episode.status} />
+        </div>
 
-      <div className="flex items-center justify-between gap-2 text-xs text-gray-500">
-        <span>{created}</span>
+        {episode.lesson && (
+          <p className="mb-3 text-xs text-gray-400 line-clamp-2">{episode.lesson}</p>
+        )}
 
-        <div className="flex gap-2">
-          {episode.youtube_url && (
-            <a
-              href={episode.youtube_url}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="rounded-lg bg-red-700 px-3 py-1 text-white hover:bg-red-600 font-medium"
-            >
-              YouTube ↗
-            </a>
-          )}
-          {episode.status === "awaiting_approval" && (
+        <div className="flex items-center justify-between gap-2 text-xs text-gray-500">
+          <span>{created}</span>
+
+          <div className="flex gap-2">
+            {episode.youtube_url && (
+              <a
+                href={episode.youtube_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="rounded-lg bg-red-700 px-3 py-1 text-white hover:bg-red-600 font-medium"
+              >
+                YouTube ↗
+              </a>
+            )}
+            {episode.status === "awaiting_approval" && (
+              <button
+                className="rounded-lg bg-indigo-600 px-3 py-1 text-white hover:bg-indigo-500 font-medium disabled:opacity-50"
+                onClick={handleApprove}
+                disabled={approving}
+              >
+                {approving ? "Publishing…" : "Approve"}
+              </button>
+            )}
             <button
-              className="rounded-lg bg-indigo-600 px-3 py-1 text-white hover:bg-indigo-500 font-medium disabled:opacity-50"
-              onClick={handleApprove}
-              disabled={approving}
+              className="rounded-lg bg-surface-600 px-3 py-1 text-gray-300 hover:bg-surface-500 font-medium disabled:opacity-50"
+              onClick={handleRetry}
+              disabled={retrying}
+              title="Re-trigger workflow for this episode"
             >
-              {approving ? "Publishing…" : "Approve"}
+              {retrying ? "Retrying…" : "Retry"}
             </button>
-          )}
+          </div>
         </div>
-      </div>
 
-      {error && <p className="mt-2 text-xs text-red-400">{error}</p>}
+        {error && <p className="mt-2 text-xs text-red-400">{error}</p>}
+      </div>
     </div>
   );
 }

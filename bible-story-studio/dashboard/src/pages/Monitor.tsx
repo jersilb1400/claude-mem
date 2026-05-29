@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
-import { fetchQueue, fetchCostSummary } from "../api.js";
-import type { CostSummary } from "../types.js";
+import { fetchQueue, fetchCostSummary, getAnalytics } from "../api.js";
+import type { CostSummary, AnalyticsRow } from "../types.js";
 
 interface HealthStatus {
   status: string;
@@ -33,11 +33,12 @@ export default function Monitor() {
   const [health, setHealth] = useState<HealthStatus | null>(null);
   const [healthError, setHealthError] = useState<string | null>(null);
   const [costs, setCosts] = useState<CostSummary[]>([]);
+  const [analytics, setAnalytics] = useState<AnalyticsRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   const workerUrl = localStorage.getItem("WORKER_URL") ?? "";
-  const renderEndpoint = workerUrl; // Health check proxied through worker via /health would need render endpoint — use best-effort
+  // Health check proxied through worker via /health — render endpoint is the worker URL itself
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -52,6 +53,11 @@ export default function Monitor() {
       // Cost summary
       fetchCostSummary()
         .then(setCosts)
+        .catch(() => {}),
+
+      // Analytics
+      getAnalytics()
+        .then((rows) => setAnalytics(rows.slice(0, 5)))
         .catch(() => {}),
 
       // Render health — call worker /health which is proxied (if not, show offline)
@@ -154,6 +160,34 @@ export default function Monitor() {
             <div className="rounded-xl bg-surface-800 p-6 text-center">
               <p className="text-sm text-gray-500">No cost data yet.</p>
               <p className="mt-1 text-xs text-gray-600">Costs are logged as episodes are produced.</p>
+            </div>
+          )}
+
+          {/* Analytics — top 5 episodes by views */}
+          {analytics.length > 0 && (
+            <div className="rounded-xl bg-surface-800 p-4">
+              <p className="mb-3 text-sm font-semibold text-gray-300">Top Episodes by Views</p>
+              <div className="space-y-2">
+                {analytics.map((row) => (
+                  <div key={row.episode_id} className="flex items-center justify-between gap-2 text-sm">
+                    <span className="truncate text-gray-300 flex-1">{row.title}</span>
+                    <div className="flex items-center gap-3 text-xs text-gray-500 shrink-0">
+                      <span title="Views">👁 {row.views.toLocaleString()}</span>
+                      <span title="Likes">👍 {row.likes.toLocaleString()}</span>
+                      <span title="Comments">💬 {row.comments.toLocaleString()}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {analytics.length === 0 && (
+            <div className="rounded-xl bg-surface-800 p-6 text-center">
+              <p className="text-sm text-gray-500">No analytics yet.</p>
+              <p className="mt-1 text-xs text-gray-600">
+                Set YOUTUBE_API_KEY — analytics are fetched daily at 10:00 UTC.
+              </p>
             </div>
           )}
         </div>

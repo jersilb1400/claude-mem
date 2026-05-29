@@ -1,0 +1,33 @@
+{
+  // Local development config — runs against local D1/R2, no production data touched
+  // Usage: cd cloudflare && npx wrangler dev --config wrangler.dev.jsonc
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "bible-story-studio-dev",
+  "main": "worker.ts",
+  "compatibility_date": "2026-05-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "account_id": "fd5b09ffec9792936392a2fdeddf8590",
+
+  "workflows": [
+    { "name": "studio-workflow-dev", "binding": "STUDIO_WORKFLOW", "class_name": "StudioWorkflow" },
+    { "name": "shorts-workflow-dev", "binding": "SHORTS_WORKFLOW", "class_name": "ShortsWorkflow" }
+  ],
+
+  "r2_buckets": [
+    { "binding": "ARTIFACTS", "bucket_name": "bible-story-artifacts-dev" }
+  ],
+
+  "d1_databases": [
+    {
+      "binding": "SERIES_MEMORY",
+      "database_name": "bible-videos-series-memory-dev",
+      "database_id": "00000000-0000-0000-0000-000000000000"
+    }
+  ],
+
+  // No cron triggers in dev
+  "vars": {
+    "REQUIRE_APPROVAL": "true",
+    "PROMOTE_AFTER_HOURS": "9999"
+  }
+}

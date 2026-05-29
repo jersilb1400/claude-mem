@@ -1,4 +1,4 @@
-.PHONY: help deploy secrets monitor run topics youtube-oauth tunnel typecheck cost-report dashboard
+.PHONY: help deploy secrets monitor run topics youtube-oauth tunnel typecheck cost-report dashboard health-check dev
 
 # Set WORKER_URL to your deployed worker URL:
 #   export WORKER_URL=https://bible-story-studio.<subdomain>.workers.dev
@@ -20,6 +20,8 @@ help:
 	@echo "  make typecheck      TypeScript type check (worker + render)"
 	@echo "  make cost-report    Print cost breakdown by episode/month/provider"
 	@echo "  make dashboard      Build + deploy admin dashboard to Cloudflare Pages"
+	@echo "  make health-check   Pre-deploy health check — verifies all external APIs"
+	@echo "  make dev            Start local dev worker (creates local D1, no production data)"
 	@echo ""
 
 deploy:
@@ -83,3 +85,9 @@ dashboard:
 	@echo "Deploying to Cloudflare Pages..."
 	@cd cloudflare && npx wrangler pages deploy ../dashboard/dist --project-name bible-story-dashboard
 	@echo "   ✓ Dashboard deployed"
+
+health-check:
+	@bun run scripts/health-check.ts
+
+dev:
+	@cd cloudflare && bash dev-setup.sh && npx wrangler dev --config wrangler.dev.jsonc

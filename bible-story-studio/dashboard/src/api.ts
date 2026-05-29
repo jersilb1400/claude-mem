@@ -1,4 +1,4 @@
-import type { Episode, Topic, CostEntry, CostSummary } from "./types.js";
+import type { Episode, Topic, CostEntry, CostSummary, Character, AnalyticsRow } from "./types.js";
 
 function getConfig(): { workerUrl: string; token: string } {
   return {
@@ -62,4 +62,45 @@ export async function fetchCosts(episodeId: string): Promise<CostEntry[]> {
 
 export async function fetchCostSummary(): Promise<CostSummary[]> {
   return apiFetch<CostSummary[]>("/costs/summary");
+}
+
+/** Feature 1: Returns the full URL for an episode thumbnail */
+export function thumbnailUrl(workerUrl: string, id: string): string {
+  return `${workerUrl.replace(/\/$/, "")}/thumbnail/${id}`;
+}
+
+/** Feature 2: Fetch all characters from the character library */
+export async function getCharacters(): Promise<Character[]> {
+  return apiFetch<Character[]>("/characters");
+}
+
+/** Feature 3: Fetch latest analytics snapshot per episode */
+export async function getAnalytics(): Promise<AnalyticsRow[]> {
+  return apiFetch<AnalyticsRow[]>("/analytics");
+}
+
+/** Feature 3: Fetch analytics history for one episode */
+export async function getEpisodeAnalytics(episodeId: string): Promise<AnalyticsRow[]> {
+  return apiFetch<AnalyticsRow[]>(`/analytics/${episodeId}`);
+}
+
+/** Feature 4: Re-trigger workflow for any episode */
+export async function retryEpisode(
+  workerUrl: string,
+  token: string,
+  id: string,
+): Promise<{ newInstanceId: string; topic: string; originalId: string }> {
+  const url = `${workerUrl.replace(/\/$/, "")}/retry/${id}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => res.statusText);
+    throw new Error(`${res.status}: ${text}`);
+  }
+  return res.json() as Promise<{ newInstanceId: string; topic: string; originalId: string }>;
 }

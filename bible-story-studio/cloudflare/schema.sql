@@ -57,6 +57,19 @@ CREATE TABLE IF NOT EXISTS costs (
 CREATE INDEX IF NOT EXISTS costs_episode_idx ON costs(episode_id);
 CREATE INDEX IF NOT EXISTS costs_recorded_idx ON costs(recorded_at);
 
+-- Feature: Analytics — YouTube view/like/comment snapshots
+CREATE TABLE IF NOT EXISTS analytics (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  episode_id  TEXT    NOT NULL,
+  youtube_id  TEXT    NOT NULL,
+  views       INTEGER DEFAULT 0,
+  likes       INTEGER DEFAULT 0,
+  comments    INTEGER DEFAULT 0,
+  fetched_at  INTEGER DEFAULT (unixepoch())
+);
+CREATE INDEX IF NOT EXISTS analytics_episode_idx ON analytics(episode_id);
+CREATE INDEX IF NOT EXISTS analytics_fetched_idx ON analytics(fetched_at);
+
 -- Seed topics (already applied; safe to re-run due to INSERT OR IGNORE)
 INSERT OR IGNORE INTO topics_queue (topic, priority) VALUES
   ('Noah and the Great Flood',                    10),

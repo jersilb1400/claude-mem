@@ -48,3 +48,24 @@ export interface HealthStatus {
   service: string;
   ts: string;
 }
+
+export interface Character {
+  id: string;
+  name: string;
+  description: string;
+  palette_skin: string;
+  palette_hair: string;
+  palette_robe: string;
+  reference_sheet_key: string | null;
+  created_at: number;
+}
+
+export interface AnalyticsRow {
+  episode_id: string;
+  youtube_id: string;
+  title: string;
+  views: number;
+  likes: number;
+  comments: number;
+  fetched_at: number;
+}

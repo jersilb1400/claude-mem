@@ -2,8 +2,9 @@ import { useState, useEffect } from "react";
 import Episodes from "./pages/Episodes.js";
 import Queue from "./pages/Queue.js";
 import Monitor from "./pages/Monitor.js";
+import Characters from "./pages/Characters.js";
 
-type Tab = "episodes" | "queue" | "monitor";
+type Tab = "episodes" | "queue" | "monitor" | "characters";
 
 interface Settings {
   workerUrl: string;
@@ -65,6 +66,7 @@ const TABS: { id: Tab; label: string; icon: string }[] = [
   { id: "episodes", label: "Episodes", icon: "🎬" },
   { id: "queue", label: "Queue", icon: "📋" },
   { id: "monitor", label: "Monitor", icon: "📊" },
+  { id: "characters", label: "Characters", icon: "👥" },
 ];
 
 export default function App() {
@@ -109,6 +111,7 @@ export default function App() {
             {tab === "episodes" && <Episodes />}
             {tab === "queue" && <Queue />}
             {tab === "monitor" && <Monitor />}
+            {tab === "characters" && <Characters />}
           </>
         )}
       </main>
