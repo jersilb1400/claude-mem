@@ -1,0 +1,24 @@
+{
+  "name": "bible-story-studio",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Fully autonomous pipeline that writes children's Bible stories, renders cute cartoon animated videos, and publishes them to YouTube.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "run": "tsx src/index.ts run",
+    "run:topic": "tsx src/index.ts run --topic",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@resvg/resvg-js": "^2.6.2",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  }
+}
