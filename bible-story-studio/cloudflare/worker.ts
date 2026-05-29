@@ -1,29 +1,25 @@
 /**
- * Production control plane — Cloudflare Workflows orchestrator.
+ * Bible Story Studio — Cloudflare Workflows control plane.
  *
- * This is the recommended way to run the studio autonomously at scale. It uses
- * Cloudflare for the durable, observable control plane and offloads the two
- * GPU/CPU-heavy steps (model inference + ffmpeg assembly) to specialized
- * compute:
+ * Architecture:
+ *   Cron Trigger (daily) → StudioWorkflow (durable, checkpointed)
+ *     step 1  story + safety + metadata   → OpenRouter (Nous Hermes 4 / Llama 3.3)
+ *     step 2  keyframes                   → fal.ai Flux 2  (character-consistent)
+ *     step 3  animation                   → fal.ai PixVerse V4.5  (cartoon specialist)
+ *     step 4  voiceover                   → ElevenLabs  (warm kids narration)
+ *     step 5  music                       → Suno API
+ *     step 6  assemble (ffmpeg)           → Hetzner render box HTTP service
+ *     step 7  thumbnail                   → Hetzner render box
+ *     step 8  series memory               → D1  (record episode, mark topic used)
+ *     step 9  publish                     → YouTube Data API v3
  *
- *   Cron Trigger ─▶ Workflow (durable steps, auto-retry, R2 artifacts)
- *        │
- *        ├─ step: story/metadata   → OpenRouter (Nous Hermes)
- *        ├─ step: keyframes         → fal.ai Flux 2  (or your Hetzner ComfyUI)
- *        ├─ step: animate           → fal.ai PixVerse/Kling (or Hetzner Wan 2.7)
- *        ├─ step: voiceover         → ElevenLabs / self-hosted Kokoro
- *        ├─ step: assemble (ffmpeg) → Hetzner render box / Cloudflare Container
- *        └─ step: publish           → YouTube Data API v3
+ * Each step.do() is checkpointed: a failure at step 6 does not re-pay for
+ * the story, keyframes, or animation from earlier steps.
  *
- * Each `step.do(...)` is checkpointed: if a later step fails, the Workflow
- * resumes from the last success instead of re-paying for earlier model calls.
- *
- * NOTE: This file is a deployable reference. The CPU-bound ffmpeg compositing
- * does not run inside a Worker — `assemble` calls out to your render service
- * (the same code in ../src/stages/assemble.ts, wrapped in a tiny HTTP server on
- * your Hetzner GPU/CPU box, or a Cloudflare Container). Everything else runs in
- * the Worker. Install deps and types before deploying:
+ * Deploy:
  *   npm i -D wrangler @cloudflare/workers-types
+ *   npx wrangler secret put OPENROUTER_API_KEY   # etc. for all secrets
+ *   npx wrangler deploy
  */
 import {
   WorkflowEntrypoint,
@@ -31,13 +27,18 @@ import {
   type WorkflowStep,
 } from "cloudflare:workers";
 
+// ─── Types ────────────────────────────────────────────────────────────────────
+
 export interface Env {
   STUDIO_WORKFLOW: Workflow;
   ARTIFACTS: R2Bucket;
+  SERIES_MEMORY: D1Database;
+  // Secrets (set via `wrangler secret put`)
   OPENROUTER_API_KEY: string;
   FAL_API_KEY: string;
   ELEVENLABS_API_KEY: string;
-  RENDER_ENDPOINT: string; // e.g. https://render.your-hetzner-box.example
+  SUNO_API_KEY: string;
+  RENDER_ENDPOINT: string;   // e.g. https://render.your-hetzner-box.example
   RENDER_TOKEN: string;
   YOUTUBE_CLIENT_ID: string;
   YOUTUBE_CLIENT_SECRET: string;
@@ -45,56 +46,251 @@ export interface Env {
 }
 
 interface Params {
-  topic: string;
+  topic?: string;  // optional override; cron picks from D1 queue when absent
 }
+
+interface StoryOutput {
+  title: string;
+  source: string;
+  lesson: string;
+  characters: Array<{
+    name: string;
+    description: string;
+    palette: { skin: string; hair: string; robe: string };
+  }>;
+  scenes: Array<{
+    narration: string;
+    visual: string;
+    characters: string[];
+    setting: string;
+  }>;
+}
+
+interface RenderResult {
+  episodeKey: string;   // R2 key for episode.mp4
+  thumbnailKey: string; // R2 key for thumbnail.jpg
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+async function openrouterChat(
+  apiKey: string,
+  model: string,
+  system: string,
+  user: string,
+  json = false,
+): Promise<string> {
+  const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+      "HTTP-Referer": "https://bible-videos-for-kids.pages.dev",
+      "X-Title": "Bible Videos for Kids",
+    },
+    body: JSON.stringify({
+      model,
+      temperature: 0.8,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+      ...(json ? { response_format: { type: "json_object" } } : {}),
+    }),
+  });
+  if (!res.ok) throw new Error(`OpenRouter ${res.status}: ${await res.text()}`);
+  const data = (await res.json()) as { choices?: { message?: { content?: string } }[] };
+  const content = data.choices?.[0]?.message?.content;
+  if (!content) throw new Error("OpenRouter returned empty content");
+  return content;
+}
+
+function parseJson<T>(raw: string): T {
+  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
+  const body = fenced ? fenced[1]! : raw;
+  const start = body.indexOf("{");
+  const end = body.lastIndexOf("}");
+  if (start === -1 || end === -1) throw new Error("No JSON in model output");
+  return JSON.parse(body.slice(start, end + 1)) as T;
+}
+
+async function r2Put(bucket: R2Bucket, key: string, data: ArrayBuffer, contentType: string): Promise<void> {
+  await bucket.put(key, data, { httpMetadata: { contentType } });
+}
+
+// ─── Workflow ─────────────────────────────────────────────────────────────────
 
 export class StudioWorkflow extends WorkflowEntrypoint<Env, Params> {
   async run(event: WorkflowEvent<Params>, step: WorkflowStep): Promise<unknown> {
-    const topic = event.payload.topic;
     const id = event.instanceId;
 
-    // 1. Story + safety + metadata (cheap, LLM). Checkpointed as JSON.
-    const story = await step.do("story", async () => {
-      const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${this.env.OPENROUTER_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model: "nousresearch/hermes-4-405b",
-          response_format: { type: "json_object" },
-          messages: [
-            { role: "system", content: "Children's Bible storyteller. Return strict JSON." },
-            { role: "user", content: `Write a 5-7 scene cartoon episode about: ${topic}` },
-          ],
-        }),
-      });
-      if (!res.ok) throw new Error(`story ${res.status}`);
-      return res.json();
+    // ── 0. Pick topic from D1 queue (or use override) ────────────────────────
+    const topic = await step.do("pick-topic", async () => {
+      if (event.payload.topic) return event.payload.topic;
+      const row = await this.env.SERIES_MEMORY
+        .prepare("SELECT topic FROM topics_queue WHERE used = 0 ORDER BY priority DESC, id ASC LIMIT 1")
+        .first<{ topic: string }>();
+      if (!row) throw new Error("Topic queue is empty — add more topics to D1 topics_queue");
+      return row.topic;
     });
 
-    // 2. Keyframes via fal (Flux 2 multi-ref). Returns R2 keys.
-    const images = await step.do(
+    // ── 1. Story generation (Nous Hermes 4 — best creative writing) ──────────
+    const story = await step.do("story", async () => {
+      const raw = await openrouterChat(
+        this.env.OPENROUTER_API_KEY,
+        "nousresearch/hermes-4-405b",
+        "You are a warm, gentle children's Bible storyteller for ages 3-8. Return STRICT JSON only.",
+        `Write a 5-7 scene animated episode about: "${topic}".\n\nReturn JSON:\n{\n  "title": "catchy kid-friendly title (max 70 chars)",\n  "source": "Bible book/passage",\n  "lesson": "one gentle sentence moral",\n  "characters": [{"name":"...","description":"stable look","palette":{"skin":"#hex","hair":"#hex","robe":"#hex"}}],\n  "scenes": [{"narration":"1-2 short sentences","visual":"cartoon description","characters":["names"],"setting":"day|night|sunrise|indoor|water|desert"}]\n}`,
+        true,
+      );
+      return parseJson<StoryOutput>(raw);
+    });
+
+    // ── 2. Safety gate (Claude Haiku — fast + cheap) ──────────────────────────
+    await step.do("safety", async () => {
+      const text = story.scenes.map((s) => s.narration).join(" ").toLowerCase();
+      const banned = ["kill", "blood", "gore", "hell", "demon", "sexy", "violence", "weapon", "gun", "drug"];
+      const hit = banned.find((w) => text.includes(w));
+      if (hit) throw new Error(`Safety blocked: contains "${hit}"`);
+      // LLM safety review via OpenRouter utility model
+      const raw = await openrouterChat(
+        this.env.OPENROUTER_API_KEY,
+        "meta-llama/llama-3.3-70b-instruct",
+        "Strict content-safety reviewer for a preschool Bible channel.",
+        `Is this narration safe for ages 3-8? Reply JSON {\"safe\":bool,\"reason\":string}.\n\n${text}`,
+        true,
+      );
+      const v = parseJson<{ safe: boolean; reason: string }>(raw);
+      if (!v.safe) throw new Error(`Safety blocked: ${v.reason}`);
+    });
+
+    // ── 3. Character-consistent keyframes (Flux 2 via fal.ai) ─────────────────
+    const imageKeys = await step.do(
       "keyframes",
-      { retries: { limit: 3, delay: "10 seconds", backoff: "exponential" } },
-      async () => this.renderKeyframes(id, story),
+      { retries: { limit: 3, delay: "15 seconds", backoff: "exponential" } },
+      async () => {
+        const keys: string[] = [];
+        for (let i = 0; i < story.scenes.length; i++) {
+          const scene = story.scenes[i]!;
+          const cast = story.characters
+            .filter((c) => scene.characters.includes(c.name))
+            .map((c) => `${c.name}: ${c.description}, palette ${JSON.stringify(c.palette)}`)
+            .join("; ");
+          const prompt = `Cute flat-vector cartoon for preschoolers, soft pastel colors, friendly rounded shapes, big eyes. ${scene.visual}. Characters — ${cast}. Setting: ${scene.setting}. No text overlays.`;
+          const res = await fetch("https://fal.run/fal-ai/flux-2", {
+            method: "POST",
+            headers: { Authorization: `Key ${this.env.FAL_API_KEY}`, "Content-Type": "application/json" },
+            body: JSON.stringify({ prompt, image_size: { width: 1920, height: 1080 } }),
+          });
+          if (!res.ok) throw new Error(`Flux2 ${res.status}: ${await res.text()}`);
+          const data = (await res.json()) as { images?: { url: string }[] };
+          const url = data.images?.[0]?.url;
+          if (!url) throw new Error("Flux2 returned no image");
+          const img = await (await fetch(url)).arrayBuffer();
+          const key = `${id}/images/scene-${String(i).padStart(2, "0")}.png`;
+          await r2Put(this.env.ARTIFACTS, key, img, "image/png");
+          keys.push(key);
+        }
+        return keys;
+      },
     );
 
-    // 3. Animate each keyframe (fal PixVerse/Kling). Returns R2 keys.
-    const clips = await step.do(
+    // ── 4. Animation — PixVerse V4.5 (cartoon/anime specialist) ──────────────
+    const clipKeys = await step.do(
       "animate",
       { retries: { limit: 3, delay: "30 seconds", backoff: "exponential" } },
-      async () => this.animate(id, images),
+      async () => {
+        const keys: string[] = [];
+        for (let i = 0; i < imageKeys.length; i++) {
+          const imgObj = await this.env.ARTIFACTS.get(imageKeys[i]!);
+          if (!imgObj) throw new Error(`R2 image missing: ${imageKeys[i]}`);
+          const dataUri = `data:image/png;base64,${btoa(
+            String.fromCharCode(...new Uint8Array(await imgObj.arrayBuffer())),
+          )}`;
+          const res = await fetch("https://fal.run/fal-ai/pixverse/v4.5/image-to-video", {
+            method: "POST",
+            headers: { Authorization: `Key ${this.env.FAL_API_KEY}`, "Content-Type": "application/json" },
+            body: JSON.stringify({
+              image_url: dataUri,
+              prompt: "gentle cute cartoon motion, soft parallax, child-friendly, no camera shake",
+              duration: 6,
+              style: "cartoon",
+            }),
+          });
+          if (!res.ok) throw new Error(`PixVerse ${res.status}: ${await res.text()}`);
+          const data = (await res.json()) as { video?: { url: string } };
+          const url = data.video?.url;
+          if (!url) throw new Error("PixVerse returned no video");
+          const clip = await (await fetch(url)).arrayBuffer();
+          const key = `${id}/clips/scene-${String(i).padStart(2, "0")}.mp4`;
+          await r2Put(this.env.ARTIFACTS, key, clip, "video/mp4");
+          keys.push(key);
+        }
+        return keys;
+      },
     );
 
-    // 4. Voiceover (ElevenLabs / Kokoro) → R2 keys.
-    const audio = await step.do("voiceover", async () => this.voiceover(id, story));
+    // ── 5. Voiceover — ElevenLabs (most natural for kids narration) ───────────
+    const audioKeys = await step.do(
+      "voiceover",
+      { retries: { limit: 3, delay: "10 seconds", backoff: "exponential" } },
+      async () => {
+        const keys: string[] = [];
+        // Rachel voice — warm, clear, perfect for children's content
+        const voiceId = "21m00Tcm4TlvDq8ikWAM";
+        for (let i = 0; i < story.scenes.length; i++) {
+          const text = story.scenes[i]!.narration;
+          const res = await fetch(
+            `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=mp3_44100_128`,
+            {
+              method: "POST",
+              headers: { "xi-api-key": this.env.ELEVENLABS_API_KEY, "Content-Type": "application/json" },
+              body: JSON.stringify({
+                text,
+                model_id: "eleven_multilingual_v2",
+                voice_settings: { stability: 0.75, similarity_boost: 0.85, style: 0.3, use_speaker_boost: true },
+              }),
+            },
+          );
+          if (!res.ok) throw new Error(`ElevenLabs ${res.status}: ${await res.text()}`);
+          const key = `${id}/audio/scene-${String(i).padStart(2, "0")}.mp3`;
+          await r2Put(this.env.ARTIFACTS, key, await res.arrayBuffer(), "audio/mpeg");
+          keys.push(key);
+        }
+        return keys;
+      },
+    );
 
-    // 5. Final compositing on the render box (ffmpeg). Returns the R2 key.
-    const finalKey = await step.do(
+    // ── 6. Music bed — Suno API ───────────────────────────────────────────────
+    const musicKey = await step.do(
+      "music",
+      { retries: { limit: 2, delay: "20 seconds", backoff: "exponential" } },
+      async () => {
+        // Suno async flow: POST → poll → download
+        const initRes = await fetch("https://api.suno.ai/api/generate", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${this.env.SUNO_API_KEY}`, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            prompt: `Gentle, uplifting instrumental children's background music for a Bible story about ${story.title}. Soft orchestral, warm, peaceful, no lyrics. 60 seconds.`,
+            make_instrumental: true,
+            wait_audio: true,
+          }),
+        });
+        if (!initRes.ok) throw new Error(`Suno ${initRes.status}: ${await initRes.text()}`);
+        const data = (await initRes.json()) as Array<{ audio_url?: string }>;
+        const url = data[0]?.audio_url;
+        if (!url) throw new Error("Suno returned no audio URL");
+        const music = await (await fetch(url)).arrayBuffer();
+        const key = `${id}/audio/music.mp3`;
+        await r2Put(this.env.ARTIFACTS, key, music, "audio/mpeg");
+        return key;
+      },
+    );
+
+    // ── 7. Assembly + thumbnail — Hetzner render box (ffmpeg) ─────────────────
+    const rendered = await step.do(
       "assemble",
-      { timeout: "15 minutes", retries: { limit: 2, delay: "20 seconds", backoff: "exponential" } },
+      { timeout: "20 minutes", retries: { limit: 2, delay: "30 seconds", backoff: "exponential" } },
       async () => {
         const res = await fetch(`${this.env.RENDER_ENDPOINT}/assemble`, {
           method: "POST",
@@ -102,60 +298,156 @@ export class StudioWorkflow extends WorkflowEntrypoint<Env, Params> {
             Authorization: `Bearer ${this.env.RENDER_TOKEN}`,
             "Content-Type": "application/json",
           },
-          body: JSON.stringify({ id, story, clips, audio }),
+          body: JSON.stringify({
+            id,
+            story,
+            clipKeys,
+            audioKeys,
+            musicKey,
+            imageKeys,
+            r2Bucket: "bible-story-artifacts",
+          }),
         });
-        if (!res.ok) throw new Error(`assemble ${res.status}`);
-        return ((await res.json()) as { key: string }).key;
+        if (!res.ok) throw new Error(`Render service ${res.status}: ${await res.text()}`);
+        return (await res.json()) as RenderResult;
       },
     );
 
-    // 6. Optional human-review hold for kids content, then publish.
-    // await step.waitForEvent("approval", { timeout: "24 hours" }); // uncomment to gate
-    const published = await step.do("publish", async () => this.publish(finalKey, story));
+    // ── 8. SEO metadata (Llama 3.3 — fast + structured) ──────────────────────
+    const metadata = await step.do("metadata", async () => {
+      const raw = await openrouterChat(
+        this.env.OPENROUTER_API_KEY,
+        "meta-llama/llama-3.3-70b-instruct",
+        "YouTube SEO expert for a wholesome preschool Bible-stories channel. Return strict JSON.",
+        `Story: "${story.title}" (${story.source}). Lesson: ${story.lesson}.\nReturn JSON {\"title\":\"<=100 chars\",\"description\":\"3 paragraphs + hashtags\",\"tags\":[\"8-12 tags\"]}.`,
+        true,
+      );
+      return parseJson<{ title: string; description: string; tags: string[] }>(raw);
+    });
 
-    return { id, finalKey, published };
-  }
+    // ── 9. Record to D1 series memory ────────────────────────────────────────
+    await step.do("record-episode", async () => {
+      await this.env.SERIES_MEMORY
+        .prepare("INSERT INTO episodes (id, title, source, lesson, topic, status, episode_mp4_key, thumbnail_key) VALUES (?, ?, ?, ?, ?, 'assembled', ?, ?)")
+        .bind(id, story.title, story.source, story.lesson, topic, rendered.episodeKey, rendered.thumbnailKey)
+        .run();
+      await this.env.SERIES_MEMORY
+        .prepare("UPDATE topics_queue SET used = 1, used_at = unixepoch() WHERE topic = ?")
+        .bind(topic)
+        .run();
+      // Upsert character library for reuse in future episodes
+      for (const c of story.characters) {
+        await this.env.SERIES_MEMORY
+          .prepare("INSERT OR IGNORE INTO characters (id, name, description, palette_skin, palette_hair, palette_robe) VALUES (?, ?, ?, ?, ?, ?)")
+          .bind(crypto.randomUUID(), c.name, c.description, c.palette.skin, c.palette.hair, c.palette.robe)
+          .run();
+      }
+    });
 
-  // --- helpers (call out to providers; bodies elided for brevity) ----------
-  private async renderKeyframes(_id: string, _story: unknown): Promise<string[]> {
-    // POST scene prompts to https://fal.run/fal-ai/flux-2, stream results to R2.
-    throw new Error("wire up fal.ai Flux 2 here");
-  }
-  private async animate(_id: string, _images: string[]): Promise<string[]> {
-    // POST each keyframe to fal-ai/pixverse/v4.5/image-to-video, store to R2.
-    throw new Error("wire up fal.ai PixVerse/Kling here");
-  }
-  private async voiceover(_id: string, _story: unknown): Promise<string[]> {
-    // POST narration to ElevenLabs / Kokoro, store mp3s to R2.
-    throw new Error("wire up TTS here");
-  }
-  private async publish(_finalKey: string, _story: unknown): Promise<unknown> {
-    // Stream the R2 object into the YouTube resumable upload (see ../src/providers/youtube.ts).
-    throw new Error("wire up YouTube upload here");
+    // ── 10. Publish to YouTube (unlisted → human review → public) ─────────────
+    const published = await step.do("publish", async () => {
+      // Refresh OAuth access token
+      const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          client_id: this.env.YOUTUBE_CLIENT_ID,
+          client_secret: this.env.YOUTUBE_CLIENT_SECRET,
+          refresh_token: this.env.YOUTUBE_REFRESH_TOKEN,
+          grant_type: "refresh_token",
+        }),
+      });
+      if (!tokenRes.ok) throw new Error(`Token refresh ${tokenRes.status}`);
+      const { access_token } = (await tokenRes.json()) as { access_token: string };
+
+      // Get episode.mp4 from R2
+      const episodeObj = await this.env.ARTIFACTS.get(rendered.episodeKey);
+      if (!episodeObj) throw new Error("Episode MP4 not found in R2");
+      const videoBytes = await episodeObj.arrayBuffer();
+      const size = videoBytes.byteLength;
+
+      // Initiate resumable upload
+      const initRes = await fetch(
+        "https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status",
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${access_token}`,
+            "Content-Type": "application/json",
+            "X-Upload-Content-Length": String(size),
+            "X-Upload-Content-Type": "video/mp4",
+          },
+          body: JSON.stringify({
+            snippet: {
+              title: metadata.title.slice(0, 100),
+              description: metadata.description.slice(0, 4900),
+              tags: metadata.tags.slice(0, 30),
+              categoryId: "27", // Education
+            },
+            status: { privacyStatus: "unlisted", selfDeclaredMadeForKids: true },
+          }),
+        },
+      );
+      if (!initRes.ok) throw new Error(`YouTube init ${initRes.status}`);
+      const uploadUrl = initRes.headers.get("location");
+      if (!uploadUrl) throw new Error("No resumable upload URL");
+
+      // Upload the video
+      const upRes = await fetch(uploadUrl, {
+        method: "PUT",
+        headers: { "Content-Type": "video/mp4", "Content-Length": String(size) },
+        body: videoBytes,
+      });
+      if (!upRes.ok) throw new Error(`YouTube upload ${upRes.status}`);
+      const video = (await upRes.json()) as { id: string };
+
+      return { youtubeId: video.id, url: `https://youtu.be/${video.id}` };
+    });
+
+    // ── 11. Update D1 with YouTube info ──────────────────────────────────────
+    await step.do("update-episode-record", async () => {
+      await this.env.SERIES_MEMORY
+        .prepare("UPDATE episodes SET status = 'published', youtube_id = ?, youtube_url = ?, youtube_privacy = 'unlisted', published_at = unixepoch() WHERE id = ?")
+        .bind(published.youtubeId, published.url, id)
+        .run();
+    });
+
+    return { id, topic, title: story.title, ...published };
   }
 }
 
+// ─── Scheduled + HTTP handlers ───────────────────────────────────────────────
+
 export default {
-  // Daily cron trigger kicks off one autonomous episode.
+  // Daily cron: picks next topic from D1 queue automatically.
   async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
-    const topics = [
-      "Noah's Ark",
-      "David and Goliath",
-      "Jonah and the Big Fish",
-      "The Good Samaritan",
-      "Daniel and the Lions' Den",
-    ];
-    const topic = topics[Math.floor(Math.random() * topics.length)]!;
-    await env.STUDIO_WORKFLOW.create({ params: { topic } });
+    await env.STUDIO_WORKFLOW.create({ params: {} });
   },
 
-  // Manual trigger: POST /run {"topic": "..."}
+  // Manual HTTP trigger: POST /run {"topic": "..."} (optional topic override)
   async fetch(req: Request, env: Env): Promise<Response> {
-    if (req.method !== "POST") return new Response("POST /run", { status: 405 });
-    const { topic } = (await req.json()) as { topic?: string };
-    const instance = await env.STUDIO_WORKFLOW.create({
-      params: { topic: topic ?? "Noah's Ark" },
-    });
-    return Response.json({ id: instance.id });
+    const url = new URL(req.url);
+
+    if (req.method === "POST" && url.pathname === "/run") {
+      const body = (await req.json().catch(() => ({}))) as { topic?: string };
+      const instance = await env.STUDIO_WORKFLOW.create({ params: { topic: body.topic } });
+      return Response.json({ instanceId: instance.id, topic: body.topic ?? "(auto from queue)" });
+    }
+
+    if (req.method === "GET" && url.pathname === "/queue") {
+      const rows = await env.SERIES_MEMORY
+        .prepare("SELECT topic, priority, used, used_at FROM topics_queue ORDER BY used ASC, priority DESC")
+        .all();
+      return Response.json(rows.results);
+    }
+
+    if (req.method === "GET" && url.pathname === "/episodes") {
+      const rows = await env.SERIES_MEMORY
+        .prepare("SELECT id, title, source, status, youtube_url, created_at FROM episodes ORDER BY created_at DESC LIMIT 50")
+        .all();
+      return Response.json(rows.results);
+    }
+
+    return new Response("Bible Videos for Kids\nPOST /run  GET /queue  GET /episodes", { status: 200 });
   },
 };

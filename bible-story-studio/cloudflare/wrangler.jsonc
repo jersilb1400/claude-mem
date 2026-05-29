@@ -1,12 +1,11 @@
 {
-  // Deploy the autonomous control plane to Cloudflare.
-  //   npm i -D wrangler @cloudflare/workers-types
-  //   npx wrangler deploy
+  // Deploy: npm i -D wrangler @cloudflare/workers-types && npx wrangler deploy
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "bible-story-studio",
-  "main": "worker.ts",
+  "main": "cloudflare/worker.ts",
   "compatibility_date": "2026-05-01",
   "compatibility_flags": ["nodejs_compat"],
+  "account_id": "fd5b09ffec9792936392a2fdeddf8590",
 
   // Durable, checkpointed orchestration.
   "workflows": [
@@ -17,15 +16,31 @@
     }
   ],
 
-  // Artifact storage (S3-compatible). Mirrors src/storage.ts.
-  "r2_buckets": [{ "binding": "ARTIFACTS", "bucket_name": "bible-story-artifacts" }],
+  // Artifact storage — episode.mp4, thumbnails, intermediates.
+  "r2_buckets": [
+    { "binding": "ARTIFACTS", "bucket_name": "bible-story-artifacts" }
+  ],
+
+  // Series memory — episode history, character library, topic queue.
+  "d1_databases": [
+    {
+      "binding": "SERIES_MEMORY",
+      "database_name": "bible-videos-series-memory",
+      "database_id": "f35ed912-8e44-4279-b9de-3463f68ee8b9"
+    }
+  ],
 
   // One autonomous episode per day at 15:00 UTC.
   "triggers": { "crons": ["0 15 * * *"] },
 
-  // Secrets — set with `npx wrangler secret put <NAME>` (do NOT commit values):
-  //   OPENROUTER_API_KEY, FAL_API_KEY, ELEVENLABS_API_KEY,
-  //   RENDER_ENDPOINT, RENDER_TOKEN,
-  //   YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET, YOUTUBE_REFRESH_TOKEN
+  // Secrets — set with `npx wrangler secret put <NAME>` (never commit values):
+  //   OPENROUTER_API_KEY   — Nous Hermes story + Llama metadata/safety
+  //   FAL_API_KEY          — Flux 2 images + PixVerse animation
+  //   ELEVENLABS_API_KEY   — narration TTS
+  //   RENDER_ENDPOINT      — https://<your-hetzner-box>/  (ffmpeg assembly)
+  //   RENDER_TOKEN         — shared secret for render service auth
+  //   YOUTUBE_CLIENT_ID    — OAuth2 Desktop app credential
+  //   YOUTUBE_CLIENT_SECRET
+  //   YOUTUBE_REFRESH_TOKEN
   "vars": {}
 }
