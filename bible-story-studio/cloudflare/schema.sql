@@ -13,6 +13,8 @@ CREATE TABLE IF NOT EXISTS episodes (
   youtube_privacy TEXT,
   episode_mp4_key TEXT,
   thumbnail_key   TEXT,
+  quality_score   REAL,
+  quality_reason  TEXT,
   created_at      INTEGER DEFAULT (unixepoch()),
   published_at    INTEGER
 );
@@ -25,6 +27,8 @@ CREATE TABLE IF NOT EXISTS characters (
   palette_hair        TEXT,
   palette_robe        TEXT,
   reference_sheet_key TEXT,
+  last_episode_id     TEXT,
+  last_seen_at        INTEGER,
   created_at          INTEGER DEFAULT (unixepoch())
 );
 
@@ -40,6 +44,15 @@ CREATE TABLE IF NOT EXISTS topics_queue (
   priority INTEGER DEFAULT 5,
   used     INTEGER DEFAULT 0,
   used_at  INTEGER
+);
+
+-- Feature: Playlist Manager — YouTube playlist index
+CREATE TABLE IF NOT EXISTS playlists (
+  id                  TEXT    PRIMARY KEY,
+  youtube_playlist_id TEXT,
+  title               TEXT    NOT NULL UNIQUE,
+  description         TEXT,
+  created_at          INTEGER DEFAULT (unixepoch())
 );
 
 -- Feature 6: Cost ledger — tracks spend per stage per episode

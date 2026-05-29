@@ -39,7 +39,9 @@
   //   0 15 * * *  — one autonomous episode per day
   //   0 16 * * *  — daily YouTube Short (1h after main episode)
   //   0 20 * * *  — auto-promote unlisted episodes to public
-  "triggers": { "crons": ["0 15 * * *", "0 16 * * *", "0 20 * * *", "0 10 * * *"] },
+  //   0 10 * * *  — YouTube analytics snapshot
+  //   0  9 * * 0  — weekly email digest (Sunday morning)
+  "triggers": { "crons": ["0 15 * * *", "0 16 * * *", "0 20 * * *", "0 10 * * *", "0 9 * * 0"] },
 
   // Secrets — set with `npx wrangler secret put <NAME>` (never commit values):
   //   OPENROUTER_API_KEY   — Nous Hermes story + Llama metadata/safety
@@ -52,6 +54,10 @@
   //   YOUTUBE_REFRESH_TOKEN
   //   DISCORD_WEBHOOK      — optional: Discord webhook URL for notifications
   //   PROMOTE_AFTER_HOURS  — optional: hours before unlisted→public (default 24)
-  //   YOUTUBE_API_KEY      — optional: YouTube Data API v3 key for analytics fetch (read-only, no OAuth)
+  //   YOUTUBE_API_KEY      — optional: YouTube Data API v3 key for analytics (read-only, no OAuth)
+  //   PUBLISH_WEBHOOK      — optional: outgoing webhook URL fired after each publish
+  //   RESEND_API_KEY       — optional: Resend API key for weekly email digest
+  //   DIGEST_EMAIL         — optional: recipient email for weekly digest
+  //   QUALITY_GATE_ENABLED — optional: set to "true" to LLM-score episodes before publish
   "vars": {}
 }
