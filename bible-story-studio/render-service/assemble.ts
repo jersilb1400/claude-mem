@@ -2,7 +2,7 @@ import { writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { ffmpeg, probeDuration, wrap } from "./ffmpeg.js";
 import { r2Download, r2Upload } from "./r2.js";
-import type { AssembleRequest, AssembleResult } from "./types.js";
+import type { AssembleRequest, AssembleResult, CompilationRequest, CompilationResult } from "./types.js";
 
 const FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf";
 
@@ -112,6 +112,42 @@ export async function assembleEpisode(
     r2Upload(r2Bucket, episodeKey, episodeFile, "video/mp4"),
     r2Upload(r2Bucket, thumbnailKey, thumbnailFile, "image/jpeg"),
   ]);
+
+  return { episodeKey, thumbnailKey };
+}
+
+/**
+ * Compilation Assembly — concatenates finished episode.mp4 files into one long video.
+ * Used for weekly 30–40 min compilations targeting toddler/watch-time algorithm.
+ */
+export async function assembleCompilation(
+  params: CompilationRequest & { tmpDir: string },
+): Promise<CompilationResult> {
+  const { id, episodeKeys, thumbnailKey, r2Bucket, tmpDir } = params;
+
+  // ── 1. Download all episode MP4s in parallel ─────────────────────────────
+  const episodeFiles = await Promise.all(
+    episodeKeys.map(async (key, i) => {
+      const dest = join(tmpDir, `ep-${String(i).padStart(2, "0")}.mp4`);
+      await r2Download(r2Bucket, key, dest);
+      return dest;
+    }),
+  );
+
+  // ── 2. Concat all episodes ────────────────────────────────────────────────
+  const listFile = join(tmpDir, "concat.txt");
+  writeFileSync(listFile, episodeFiles.map((f: string) => `file '${f}'`).join("\n"));
+  const compilationFile = join(tmpDir, "compilation.mp4");
+  await ffmpeg([
+    "-f", "concat", "-safe", "0", "-i", listFile,
+    "-c", "copy",
+    "-movflags", "+faststart",
+    compilationFile,
+  ]);
+
+  // ── 3. Upload to R2 ───────────────────────────────────────────────────────
+  const episodeKey = `compilations/${id}/compilation.mp4`;
+  await r2Upload(r2Bucket, episodeKey, compilationFile, "video/mp4");
 
   return { episodeKey, thumbnailKey };
 }

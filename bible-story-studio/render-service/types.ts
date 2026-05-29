@@ -45,3 +45,21 @@ export interface AssembleResult {
 
 /** Convenience alias — identical to AssembleRequest with format="short" */
 export type ShortAssembleRequest = AssembleRequest & { format: "short" };
+
+export interface CompilationRequest {
+  /** Unique compilation ID (used as R2 key prefix) */
+  id: string;
+  /** R2 keys for finished episode.mp4 files, in display order */
+  episodeKeys: string[];
+  /** R2 key of the thumbnail to reuse (first episode's thumbnail) */
+  thumbnailKey: string;
+  /** R2 bucket name */
+  r2Bucket: string;
+}
+
+export interface CompilationResult {
+  /** R2 key for the compiled video */
+  episodeKey: string;
+  /** R2 key for the thumbnail (same as input thumbnailKey) */
+  thumbnailKey: string;
+}

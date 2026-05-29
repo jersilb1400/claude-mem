@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS episodes (
   thumbnail_key   TEXT,
   quality_score   REAL,
   quality_reason  TEXT,
+  is_compilation  INTEGER DEFAULT 0,
   created_at      INTEGER DEFAULT (unixepoch()),
   published_at    INTEGER
 );
@@ -45,6 +46,14 @@ CREATE TABLE IF NOT EXISTS topics_queue (
   used     INTEGER DEFAULT 0,
   used_at  INTEGER
 );
+
+-- Market Intelligence — weekly competitor analysis reports
+CREATE TABLE IF NOT EXISTS strategy_reports (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  report_json  TEXT    NOT NULL,
+  generated_at INTEGER DEFAULT (unixepoch())
+);
+CREATE INDEX IF NOT EXISTS strategy_reports_ts_idx ON strategy_reports(generated_at);
 
 -- Feature: Playlist Manager — YouTube playlist index
 CREATE TABLE IF NOT EXISTS playlists (

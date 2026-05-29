@@ -19,6 +19,7 @@ import {
 export interface Env {
   STUDIO_WORKFLOW: Workflow;
   SHORTS_WORKFLOW: Workflow;
+  COMPILATION_WORKFLOW: Workflow;
   ARTIFACTS: R2Bucket;
   SERIES_MEMORY: D1Database;
   // Secrets (set via `wrangler secret put`)
@@ -602,7 +603,7 @@ export class StudioWorkflow extends WorkflowEntrypoint<Env, Params> {
           this.env.OPENROUTER_API_KEY,
           "nousresearch/hermes-4-405b",
           "You are a warm, gentle children's Bible storyteller for ages 3-8. Return STRICT JSON only.",
-          `Write a 5-7 scene animated episode about: "${topic}".\n\nReturn JSON:\n{\n  "title": "catchy kid-friendly title (max 70 chars)",\n  "source": "Bible book/passage",\n  "lesson": "one gentle sentence moral",\n  "characters": [{"name":"...","description":"stable look","palette":{"skin":"#hex","hair":"#hex","robe":"#hex"}}],\n  "scenes": [{"narration":"1-2 short sentences","visual":"cartoon description","characters":["names"],"setting":"day|night|sunrise|indoor|water|desert"}]\n}`,
+          `Write a 15-20 scene animated episode about: "${topic}". Target 8-12 minutes when narrated at a calm storytelling pace.\n\nReturn JSON:\n{\n  "title": "catchy kid-friendly title (max 70 chars)",\n  "source": "Bible book/passage",\n  "lesson": "one gentle sentence moral",\n  "characters": [{"name":"...","description":"stable look","palette":{"skin":"#hex","hair":"#hex","robe":"#hex"}}],\n  "scenes": [{"narration":"2-3 warm storytelling sentences (about 20-25 seconds when spoken aloud at a gentle pace)","visual":"cartoon description","characters":["names"],"setting":"day|night|sunrise|indoor|water|desert"}]\n}`,
           true,
         );
         return parseJson<StoryOutput>(raw);
@@ -1087,12 +1088,217 @@ function escapeXml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
 }
 
+// ─── Feature: Market Intelligence ────────────────────────────────────────────
+
+/** Parses ISO 8601 duration (PT1H30M45S) to total seconds. */
+function parseIso8601Duration(dur: string): number {
+  const m = dur.match(/^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/);
+  if (!m) return 0;
+  return (parseInt(m[1] ?? "0", 10) * 3600) + (parseInt(m[2] ?? "0", 10) * 60) + parseInt(m[3] ?? "0", 10);
+}
+
+interface StrategyReport {
+  generatedAt: number;
+  sampleSize: number;
+  avgDurationSec: number;
+  medianDurationSec: number;
+  pctOver8Min: number;
+  topVideoLengths: number[];
+  recommendations: string[];
+}
+
+/**
+ * Fetches real competitor data from YouTube Data API v3, then asks Llama 3.3
+ * for 3 data-backed content strategy recommendations.
+ * Stores result in D1 strategy_reports table.
+ */
+async function generateStrategyReport(env: Env): Promise<void> {
+  if (!env.YOUTUBE_API_KEY) return;
+
+  try {
+    // Step 1: Search for top Bible-story kids videos
+    const searchRes = await fetch(
+      `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodeURIComponent("Bible stories for kids animated")}&type=video&maxResults=20&order=viewCount&key=${encodeURIComponent(env.YOUTUBE_API_KEY)}`,
+    );
+    if (!searchRes.ok) throw new Error(`YouTube search ${searchRes.status}`);
+    const searchData = (await searchRes.json()) as { items?: Array<{ id?: { videoId?: string } }> };
+    const videoIds = (searchData.items ?? []).map((i) => i.id?.videoId).filter(Boolean) as string[];
+    if (videoIds.length === 0) throw new Error("No videos returned from search");
+
+    // Step 2: Fetch contentDetails + statistics for those videos
+    const detailsRes = await fetch(
+      `https://www.googleapis.com/youtube/v3/videos?part=contentDetails,statistics&id=${encodeURIComponent(videoIds.join(","))}&key=${encodeURIComponent(env.YOUTUBE_API_KEY)}`,
+    );
+    if (!detailsRes.ok) throw new Error(`YouTube videos ${detailsRes.status}`);
+    const detailsData = (await detailsRes.json()) as {
+      items?: Array<{
+        contentDetails?: { duration?: string };
+        statistics?: { viewCount?: string; likeCount?: string };
+      }>;
+    };
+
+    const durations = (detailsData.items ?? [])
+      .map((v) => parseIso8601Duration(v.contentDetails?.duration ?? ""))
+      .filter((d) => d > 0)
+      .sort((a, b) => a - b);
+
+    if (durations.length === 0) throw new Error("No valid durations parsed");
+
+    const avg = Math.round(durations.reduce((s, d) => s + d, 0) / durations.length);
+    const median = durations[Math.floor(durations.length / 2)]!;
+    const pctOver8Min = Math.round((durations.filter((d) => d > 480).length / durations.length) * 100);
+
+    // Step 3: LLM strategy recommendations based on real data
+    const statsText = `Top ${durations.length} "Bible stories for kids animated" YouTube videos (sorted by view count):
+- Average duration: ${Math.floor(avg / 60)}m ${avg % 60}s
+- Median duration: ${Math.floor(median / 60)}m ${median % 60}s
+- % over 8 minutes: ${pctOver8Min}%
+- Duration spread: ${Math.floor(durations[0]! / 60)}m–${Math.floor(durations[durations.length - 1]! / 60)}m`;
+
+    const raw = await openrouterChat(
+      env.OPENROUTER_API_KEY,
+      "meta-llama/llama-3.3-70b-instruct",
+      "You are a data-driven YouTube content strategist for a children's Bible story channel. Base every recommendation on the provided statistics. Return strict JSON.",
+      `${statsText}\n\nOur channel: animated Bible stories, ages 3-8, "Made for Kids" (no comments/notifications). We publish daily.\n\nReturn JSON: {"recommendations": ["bullet 1", "bullet 2", "bullet 3"]} — each bullet must cite a specific number from the stats above.`,
+      true,
+    );
+    const parsed = parseJson<{ recommendations: string[] }>(raw);
+
+    const report: StrategyReport = {
+      generatedAt: Math.floor(Date.now() / 1000),
+      sampleSize: durations.length,
+      avgDurationSec: avg,
+      medianDurationSec: median,
+      pctOver8Min,
+      topVideoLengths: durations,
+      recommendations: parsed.recommendations ?? [],
+    };
+
+    await env.SERIES_MEMORY
+      .prepare("INSERT INTO strategy_reports (report_json) VALUES (?)")
+      .bind(JSON.stringify(report))
+      .run()
+      .catch(() => {});
+  } catch (err) {
+    console.error("[strategy-report]", err);
+  }
+}
+
+// ─── Compilation Workflow ────────────────────────────────────────────────────
+
+interface CompilationParams {
+  /** If provided, compile exactly these episode IDs in order */
+  episodeIds?: string[];
+}
+
+interface CompilationEpisodeRow {
+  id: string;
+  title: string;
+  episode_mp4_key: string;
+  thumbnail_key: string;
+}
+
+export class CompilationWorkflow extends WorkflowEntrypoint<Env, CompilationParams> {
+  async run(event: WorkflowEvent<CompilationParams>, step: WorkflowStep): Promise<unknown> {
+    const id = event.instanceId;
+
+    try {
+      // ── 1. Resolve episodes ────────────────────────────────────────────────
+      const episodes = await step.do("resolve-episodes", async () => {
+        if (event.payload.episodeIds && event.payload.episodeIds.length >= 3) {
+          const placeholders = event.payload.episodeIds.map(() => "?").join(",");
+          const rows = await this.env.SERIES_MEMORY
+            .prepare(`SELECT id, title, episode_mp4_key, thumbnail_key FROM episodes WHERE id IN (${placeholders}) AND status = 'published'`)
+            .bind(...event.payload.episodeIds)
+            .all<CompilationEpisodeRow>();
+          return rows.results;
+        }
+        // Default: last 3-4 published episodes from the past 7 days
+        const rows = await this.env.SERIES_MEMORY
+          .prepare("SELECT id, title, episode_mp4_key, thumbnail_key FROM episodes WHERE status = 'published' AND is_compilation = 0 AND published_at > (unixepoch() - 604800) ORDER BY published_at ASC LIMIT 4")
+          .all<CompilationEpisodeRow>();
+        return rows.results;
+      });
+
+      if (episodes.length < 3) {
+        await notify(this.env, `⏭️ Compilation skipped — only ${episodes.length} episode(s) this week (need ≥ 3)`, 0x5865f2);
+        return { skipped: true, reason: "fewer than 3 episodes this week" };
+      }
+
+      // ── 2. Build title and meta ────────────────────────────────────────────
+      const titles = episodes.map((e) => e.title);
+      const n = episodes.length;
+      const titlePreview = titles.slice(0, 2).join(", ");
+      const compilationTitle = `Bible Stories for Kids — ${n} Stories | ${titlePreview} & More`;
+      const compilationDesc = [
+        `🎬 ${n} full Bible stories for children in one video! Perfect for bedtime, Sunday school, or quiet time.`,
+        "",
+        titles.map((t, i) => `${i + 1}. ${t}`).join("\n"),
+        "",
+        "📖 Gentle animated stories for ages 3-8 | Safe for all kids | Made for families",
+        "#BibleStoriesForKids #KidsBibleStories #AnimatedBible #ChildrensBible #BibleForKids",
+      ].join("\n");
+
+      const compilationMeta = {
+        title: compilationTitle.slice(0, 100),
+        description: compilationDesc.slice(0, 4900),
+        tags: ["bible stories for kids", "animated bible", "children bible", "kids bible stories", "bible cartoon", "christian kids", "sunday school", "bible compilation"],
+      };
+
+      // ── 3. Assemble via render service ─────────────────────────────────────
+      const rendered = await step.do(
+        "assemble-compilation",
+        { timeout: "20 minutes", retries: { limit: 2, delay: "30 seconds", backoff: "exponential" } },
+        async () => {
+          const res = await fetch(`${this.env.RENDER_ENDPOINT}/assemble-compilation`, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${this.env.RENDER_TOKEN}`, "Content-Type": "application/json" },
+            body: JSON.stringify({
+              id,
+              episodeKeys: episodes.map((e) => e.episode_mp4_key),
+              thumbnailKey: episodes[0]!.thumbnail_key,
+              r2Bucket: "bible-story-artifacts",
+            }),
+          });
+          if (!res.ok) throw new Error(`Render service ${res.status}: ${await res.text()}`);
+          return (await res.json()) as { episodeKey: string; thumbnailKey: string };
+        },
+      );
+
+      // ── 4. Publish to YouTube ──────────────────────────────────────────────
+      const published = await step.do(
+        "publish",
+        { retries: { limit: 2, delay: "30 seconds", backoff: "exponential" } },
+        () => publishToYouTube(this.env, rendered.episodeKey, compilationMeta),
+      );
+
+      // ── 5. Record in D1 ───────────────────────────────────────────────────
+      await step.do("record", async () => {
+        await this.env.SERIES_MEMORY
+          .prepare("INSERT INTO episodes (id, title, source, lesson, topic, status, episode_mp4_key, thumbnail_key, is_compilation, youtube_id, youtube_url, youtube_privacy, published_at) VALUES (?, ?, ?, ?, ?, 'published', ?, ?, 1, ?, ?, 'unlisted', unixepoch())")
+          .bind(id, compilationMeta.title, "Compilation", `${n} Bible stories in one video`, "compilation", rendered.episodeKey, rendered.thumbnailKey, published.youtubeId, published.url)
+          .run();
+      });
+
+      await notify(this.env, `🎞️ Compilation published (${n} episodes, ~${Math.round(n * 10)} min): **${compilationMeta.title}**\n${published.url}`, 0x57f287);
+      await fireWebhook(this.env, { id, type: "compilation", episodeCount: n, url: published.url });
+
+      return { id, episodeCount: n, url: published.url };
+    } catch (err) {
+      await notify(this.env, `❌ Compilation workflow failed: ${id}\n${String(err)}`, 0xed4245);
+      throw err;
+    }
+  }
+}
+
 export default {
   async scheduled(controller: ScheduledController, env: Env): Promise<void> {
     if (controller.cron === "0 20 * * *") { await autoPromote(env); return; }
     if (controller.cron === "0 16 * * *") { await env.SHORTS_WORKFLOW.create({ params: {} }); return; }
     if (controller.cron === "0 10 * * *") { await fetchAnalytics(env); return; }
-    if (controller.cron === "0 9 * * 0") { await sendWeeklyDigest(env); return; }
+    if (controller.cron === "0 7 * * 0")  { await generateStrategyReport(env); return; }
+    if (controller.cron === "0 9 * * 0")  { await sendWeeklyDigest(env); return; }
+    if (controller.cron === "0 18 * * 0") { await env.COMPILATION_WORKFLOW.create({ params: {} }); return; }
 
     // 0 15 * * * — daily episode
     await env.STUDIO_WORKFLOW.create({ params: {} });
@@ -1294,6 +1500,28 @@ export default {
       return jsonResponse({ newInstanceId: instance.id, topic: row.topic, originalId: epId });
     }
 
+    // GET /strategy — latest competitor market intelligence report
+    if (req.method === "GET" && url.pathname === "/strategy") {
+      const row = await env.SERIES_MEMORY
+        .prepare("SELECT report_json, generated_at FROM strategy_reports ORDER BY generated_at DESC LIMIT 1")
+        .first<{ report_json: string; generated_at: number }>();
+      if (!row) return jsonResponse({ message: "No strategy report yet. Runs every Sunday at 7am UTC." }, 404);
+      try {
+        return jsonResponse({ generatedAt: row.generated_at, ...JSON.parse(row.report_json) });
+      } catch {
+        return jsonResponse({ raw: row.report_json, generatedAt: row.generated_at });
+      }
+    }
+
+    // POST /run-compilation — manually trigger compilation workflow [Bearer]
+    if (req.method === "POST" && url.pathname === "/run-compilation") {
+      const auth = req.headers.get("Authorization");
+      if (!auth || auth !== `Bearer ${env.RENDER_TOKEN}`) return new Response("Unauthorized", { status: 401, headers: corsHeaders() });
+      const body = (await req.json().catch(() => ({}))) as { episodeIds?: string[] };
+      const instance = await env.COMPILATION_WORKFLOW.create({ params: { episodeIds: body.episodeIds } });
+      return jsonResponse({ instanceId: instance.id });
+    }
+
     // Feature 1: GET /playlists
     if (req.method === "GET" && url.pathname === "/playlists") {
       const rows = await env.SERIES_MEMORY.prepare("SELECT id, youtube_playlist_id, title, description, created_at FROM playlists ORDER BY created_at DESC").all();
@@ -1384,6 +1612,8 @@ export default {
           "",
           "POST  /run                    trigger episode (body: {topic?}) [rate limited]",
           "POST  /run-short              trigger short (body: {topic?, episodeId?}) [Bearer]",
+          "POST  /run-compilation        trigger weekly compilation [Bearer]",
+          "GET   /strategy               latest market intelligence report (YouTube competitor data)",
           "GET   /queue                  topic queue",
           "DELETE /queue/:topic          remove topic [Bearer]",
           "GET   /episodes               recent episodes (includes quality_score)",
