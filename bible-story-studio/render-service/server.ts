@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { assembleEpisode } from "./assemble.js";
+import { assembleEpisode, assembleShort } from "./assemble.js";
 import type { AssembleRequest } from "./types.js";
 
 const app = new Hono();
@@ -14,6 +14,14 @@ if (!RENDER_TOKEN) {
 
 // ── Auth middleware ────────────────────────────────────────────────────────
 app.use("/assemble", async (c, next) => {
+  const auth = c.req.header("Authorization");
+  if (!RENDER_TOKEN || auth !== `Bearer ${RENDER_TOKEN}`) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+  await next();
+});
+
+app.use("/assemble-short", async (c, next) => {
   const auth = c.req.header("Authorization");
   if (!RENDER_TOKEN || auth !== `Bearer ${RENDER_TOKEN}`) {
     return c.json({ error: "Unauthorized" }, 401);
@@ -38,6 +46,30 @@ app.post("/assemble", async (c) => {
 
   try {
     const result = await assembleEpisode({ ...body, tmpDir });
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+    console.log(`${tag} done   elapsed=${elapsed}s  key=${result.episodeKey}`);
+    return c.json(result);
+  } catch (err) {
+    console.error(`${tag} error`, err);
+    return c.json({ error: String(err) }, 500);
+  } finally {
+    rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+// Feature 5: Shorts assembly endpoint
+app.post("/assemble-short", async (c) => {
+  const body = (await c.req.json()) as AssembleRequest;
+  const { id } = body;
+  const tmpDir = join("/tmp", `render-short-${id}-${Date.now()}`);
+  mkdirSync(tmpDir, { recursive: true });
+
+  const tag = `[${new Date().toISOString()}] short=${id}`;
+  console.log(`${tag} start  title="${body.story.title}"`);
+  const t0 = Date.now();
+
+  try {
+    const result = await assembleShort({ ...body, tmpDir });
     const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
     console.log(`${tag} done   elapsed=${elapsed}s  key=${result.episodeKey}`);
     return c.json(result);

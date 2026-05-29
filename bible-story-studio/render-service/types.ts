@@ -32,11 +32,16 @@ export interface AssembleRequest {
   imageKeys: string[];
   /** R2 bucket name */
   r2Bucket: string;
+  /** Optional format flag: "short" for vertical 9:16 assembly (max 3 scenes, 60s) */
+  format?: "short";
 }
 
 export interface AssembleResult {
-  /** R2 key for the finished episode.mp4 */
+  /** R2 key for the finished episode.mp4 (or short.mp4) */
   episodeKey: string;
   /** R2 key for thumbnail.jpg */
   thumbnailKey: string;
 }
+
+/** Convenience alias — identical to AssembleRequest with format="short" */
+export type ShortAssembleRequest = AssembleRequest & { format: "short" };

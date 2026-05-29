@@ -13,6 +13,11 @@
       "name": "studio-workflow",
       "binding": "STUDIO_WORKFLOW",
       "class_name": "StudioWorkflow"
+    },
+    {
+      "name": "shorts-workflow",
+      "binding": "SHORTS_WORKFLOW",
+      "class_name": "ShortsWorkflow"
     }
   ],
 
@@ -30,8 +35,11 @@
     }
   ],
 
-  // One autonomous episode per day at 15:00 UTC.
-  "triggers": { "crons": ["0 15 * * *"] },
+  // Cron schedule:
+  //   0 15 * * *  — one autonomous episode per day
+  //   0 16 * * *  — daily YouTube Short (1h after main episode)
+  //   0 20 * * *  — auto-promote unlisted episodes to public
+  "triggers": { "crons": ["0 15 * * *", "0 16 * * *", "0 20 * * *"] },
 
   // Secrets — set with `npx wrangler secret put <NAME>` (never commit values):
   //   OPENROUTER_API_KEY   — Nous Hermes story + Llama metadata/safety
@@ -42,5 +50,7 @@
   //   YOUTUBE_CLIENT_ID    — OAuth2 Desktop app credential
   //   YOUTUBE_CLIENT_SECRET
   //   YOUTUBE_REFRESH_TOKEN
+  //   DISCORD_WEBHOOK      — optional: Discord webhook URL for notifications
+  //   PROMOTE_AFTER_HOURS  — optional: hours before unlisted→public (default 24)
   "vars": {}
 }

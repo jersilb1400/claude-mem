@@ -1,4 +1,4 @@
-.PHONY: help deploy secrets monitor run topics youtube-oauth tunnel typecheck
+.PHONY: help deploy secrets monitor run topics youtube-oauth tunnel typecheck cost-report dashboard
 
 # Set WORKER_URL to your deployed worker URL:
 #   export WORKER_URL=https://bible-story-studio.<subdomain>.workers.dev
@@ -18,6 +18,8 @@ help:
 	@echo "  make youtube-oauth  Get YouTube OAuth2 refresh token"
 	@echo "  make tunnel         Set up Cloudflare Tunnel (run on Hetzner)"
 	@echo "  make typecheck      TypeScript type check (worker + render)"
+	@echo "  make cost-report    Print cost breakdown by episode/month/provider"
+	@echo "  make dashboard      Build + deploy admin dashboard to Cloudflare Pages"
 	@echo ""
 
 deploy:
@@ -71,3 +73,13 @@ typecheck:
 	@echo "── Render service (render-service/) ─────────────────"
 	@cd render-service && bun run tsc --noEmit
 	@echo "   ✓ Render service types OK"
+
+cost-report:
+	@bun run scripts/cost-report.ts
+
+dashboard:
+	@echo "Building dashboard..."
+	@cd dashboard && npm install --silent && npm run build
+	@echo "Deploying to Cloudflare Pages..."
+	@cd cloudflare && npx wrangler pages deploy ../dashboard/dist --project-name bible-story-dashboard
+	@echo "   ✓ Dashboard deployed"

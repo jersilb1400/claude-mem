@@ -21,6 +21,11 @@
  *   Episodes stop at status "awaiting_approval".
  *   POST /approve/:id with Bearer RENDER_TOKEN to publish.
  *
+ * Cron schedule:
+ *   0 15 * * *  — daily episode (StudioWorkflow)
+ *   0 16 * * *  — daily Shorts (ShortsWorkflow, 1h after main)
+ *   0 20 * * *  — auto-promote unlisted → public
+ *
  * Deploy:
  *   cd cloudflare && npm i && npx wrangler secret put OPENROUTER_API_KEY  # etc.
  *   npx wrangler deploy
@@ -35,6 +40,7 @@ import {
 
 export interface Env {
   STUDIO_WORKFLOW: Workflow;
+  SHORTS_WORKFLOW: Workflow;
   ARTIFACTS: R2Bucket;
   SERIES_MEMORY: D1Database;
   // Secrets (set via `wrangler secret put`)
@@ -49,10 +55,19 @@ export interface Env {
   YOUTUBE_REFRESH_TOKEN: string;
   // Optional: set to "true" to hold episodes before YouTube publish
   REQUIRE_APPROVAL?: string;
+  // Optional: hours after publish before auto-promoting to public (default: "24")
+  PROMOTE_AFTER_HOURS?: string;
+  // Optional: Discord webhook URL for notifications
+  DISCORD_WEBHOOK?: string;
 }
 
 interface Params {
   topic?: string;
+}
+
+interface ShortsParams {
+  episodeId?: string; // reuse story+audio from existing episode
+  topic?: string;     // or generate fresh
 }
 
 interface StoryOutput {
@@ -95,6 +110,7 @@ interface EpisodeRow {
   youtube_privacy: string | null;
   episode_mp4_key: string;
   thumbnail_key: string;
+  audio_keys: string | null;
   created_at: number;
   published_at: number | null;
 }
@@ -161,6 +177,7 @@ async function publishToYouTube(
   env: Env,
   episodeKey: string,
   meta: SEOMeta,
+  privacyStatus = "unlisted",
 ): Promise<{ youtubeId: string; url: string }> {
   // Refresh OAuth access token
   const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
@@ -200,7 +217,7 @@ async function publishToYouTube(
           tags: meta.tags.slice(0, 30),
           categoryId: "27", // Education
         },
-        status: { privacyStatus: "unlisted", selfDeclaredMadeForKids: true },
+        status: { privacyStatus, selfDeclaredMadeForKids: true },
       }),
     },
   );
@@ -220,266 +237,792 @@ async function publishToYouTube(
   return { youtubeId: video.id, url: `https://youtu.be/${video.id}` };
 }
 
+/**
+ * Feature 3: Discord Notifications
+ * Sends an embed to the configured Discord webhook. Never throws.
+ */
+async function notify(env: Env, message: string, color = 0x5865f2): Promise<void> {
+  if (!env.DISCORD_WEBHOOK) return;
+  await fetch(env.DISCORD_WEBHOOK, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      embeds: [{ description: message, color }],
+    }),
+  }).catch(() => {}); // never fail the pipeline
+}
+
+/**
+ * Feature 6: Cost Ledger
+ * Inserts one row into the costs table. Never throws.
+ */
+async function logCost(
+  env: Env,
+  episodeId: string,
+  stage: string,
+  provider: string,
+  units: number,
+  unitType: string,
+  rateUsd: number,
+): Promise<void> {
+  const totalUsd = units * rateUsd;
+  await env.SERIES_MEMORY
+    .prepare(
+      "INSERT INTO costs (episode_id, stage, provider, units, unit_type, rate_usd, total_usd) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(episodeId, stage, provider, units, unitType, rateUsd, totalUsd)
+    .run()
+    .catch(() => {}); // never fail the pipeline
+}
+
+/**
+ * Feature 4: Topic Auto-generator
+ * Calls Llama 3.3 to generate 15 fresh Bible story topics and inserts them into D1.
+ */
+async function autoGenerateTopics(env: Env): Promise<string[]> {
+  const raw = await openrouterChat(
+    env.OPENROUTER_API_KEY,
+    "meta-llama/llama-3.3-70b-instruct",
+    "You are a children's Bible curriculum expert. Return strict JSON only.",
+    "Generate 15 unique Bible story topics suitable for children aged 3-8. These topics should be engaging and educational. Return JSON: {\"topics\": [\"...\", ...]}",
+    true,
+  );
+  const parsed = parseJson<{ topics: string[] }>(raw);
+  const topics = parsed.topics ?? [];
+
+  for (const topic of topics) {
+    await env.SERIES_MEMORY
+      .prepare("INSERT OR IGNORE INTO topics_queue (topic, priority) VALUES (?, 5)")
+      .bind(topic)
+      .run()
+      .catch(() => {});
+  }
+
+  return topics;
+}
+
+/**
+ * Feature 2: Auto-promote unlisted → public
+ * Runs on the 0 20 * * * cron.
+ */
+async function autoPromote(env: Env): Promise<void> {
+  const promoteAfterHours = parseInt(env.PROMOTE_AFTER_HOURS ?? "24", 10);
+  const cutoff = Math.floor(Date.now() / 1000) - promoteAfterHours * 3600;
+
+  const rows = await env.SERIES_MEMORY
+    .prepare(
+      "SELECT id, youtube_id, title FROM episodes WHERE status='published' AND youtube_privacy='unlisted' AND published_at < ?",
+    )
+    .bind(cutoff)
+    .all<{ id: string; youtube_id: string; title: string }>();
+
+  for (const row of rows.results) {
+    try {
+      // Refresh token
+      const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          client_id: env.YOUTUBE_CLIENT_ID,
+          client_secret: env.YOUTUBE_CLIENT_SECRET,
+          refresh_token: env.YOUTUBE_REFRESH_TOKEN,
+          grant_type: "refresh_token",
+        }),
+      });
+      if (!tokenRes.ok) throw new Error(`Token refresh ${tokenRes.status}`);
+      const { access_token } = (await tokenRes.json()) as { access_token: string };
+
+      // Update YouTube privacy to public
+      const updateRes = await fetch(
+        "https://www.googleapis.com/youtube/v3/videos?part=status",
+        {
+          method: "PUT",
+          headers: {
+            Authorization: `Bearer ${access_token}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            id: row.youtube_id,
+            status: { privacyStatus: "public" },
+          }),
+        },
+      );
+      if (!updateRes.ok) throw new Error(`YouTube update ${updateRes.status}: ${await updateRes.text()}`);
+
+      // Update D1
+      await env.SERIES_MEMORY
+        .prepare("UPDATE episodes SET youtube_privacy = 'public' WHERE id = ?")
+        .bind(row.id)
+        .run();
+
+      await notify(
+        env,
+        `📢 Auto-promoted to public: **${row.title}**\nhttps://youtu.be/${row.youtube_id}`,
+        0x57f287,
+      );
+    } catch (err) {
+      await notify(
+        env,
+        `❌ Failed to promote episode ${row.id}: ${String(err)}`,
+        0xed4245,
+      );
+    }
+  }
+}
+
+// ─── CORS helper ─────────────────────────────────────────────────────────────
+
+function corsHeaders(): HeadersInit {
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  };
+}
+
+function withCors(res: Response): Response {
+  const headers = new Headers(res.headers);
+  for (const [k, v] of Object.entries(corsHeaders())) {
+    headers.set(k, v);
+  }
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+}
+
+function jsonResponse(data: unknown, status = 200): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json", ...corsHeaders() },
+  });
+}
+
 // ─── Workflow ─────────────────────────────────────────────────────────────────
 
 export class StudioWorkflow extends WorkflowEntrypoint<Env, Params> {
   async run(event: WorkflowEvent<Params>, step: WorkflowStep): Promise<unknown> {
     const id = event.instanceId;
 
-    // ── 0. Pick topic from D1 queue (or use override) ────────────────────────
-    const topic = await step.do("pick-topic", async () => {
-      if (event.payload.topic) return event.payload.topic;
-      const row = await this.env.SERIES_MEMORY
-        .prepare("SELECT topic FROM topics_queue WHERE used = 0 ORDER BY priority DESC, id ASC LIMIT 1")
-        .first<{ topic: string }>();
-      if (!row) throw new Error("Topic queue is empty — run 'make topics' to add more");
-      return row.topic;
-    });
+    try {
+      // ── 0. Pick topic from D1 queue (or use override) ────────────────────────
+      const topic = await step.do("pick-topic", async () => {
+        if (event.payload.topic) return event.payload.topic;
+        const row = await this.env.SERIES_MEMORY
+          .prepare("SELECT topic FROM topics_queue WHERE used = 0 ORDER BY priority DESC, id ASC LIMIT 1")
+          .first<{ topic: string }>();
+        if (!row) throw new Error("Topic queue is empty — run 'make topics' to add more");
 
-    // ── 1. Story generation (Nous Hermes 4 — best creative writing) ──────────
-    const story = await step.do("story", async () => {
-      const raw = await openrouterChat(
-        this.env.OPENROUTER_API_KEY,
-        "nousresearch/hermes-4-405b",
-        "You are a warm, gentle children's Bible storyteller for ages 3-8. Return STRICT JSON only.",
-        `Write a 5-7 scene animated episode about: "${topic}".\n\nReturn JSON:\n{\n  "title": "catchy kid-friendly title (max 70 chars)",\n  "source": "Bible book/passage",\n  "lesson": "one gentle sentence moral",\n  "characters": [{"name":"...","description":"stable look","palette":{"skin":"#hex","hair":"#hex","robe":"#hex"}}],\n  "scenes": [{"narration":"1-2 short sentences","visual":"cartoon description","characters":["names"],"setting":"day|night|sunrise|indoor|water|desert"}]\n}`,
-        true,
-      );
-      return parseJson<StoryOutput>(raw);
-    });
-
-    // ── 2. Safety gate ────────────────────────────────────────────────────────
-    await step.do("safety", async () => {
-      const text = story.scenes.map((s) => s.narration).join(" ").toLowerCase();
-      const banned = ["kill", "blood", "gore", "hell", "demon", "sexy", "violence", "weapon", "gun", "drug"];
-      const hit = banned.find((w) => text.includes(w));
-      if (hit) throw new Error(`Safety blocked: contains "${hit}"`);
-      const raw = await openrouterChat(
-        this.env.OPENROUTER_API_KEY,
-        "meta-llama/llama-3.3-70b-instruct",
-        "Strict content-safety reviewer for a preschool Bible channel.",
-        `Is this narration safe for ages 3-8? Reply JSON {"safe":bool,"reason":string}.\n\n${text}`,
-        true,
-      );
-      const v = parseJson<{ safe: boolean; reason: string }>(raw);
-      if (!v.safe) throw new Error(`Safety blocked: ${v.reason}`);
-    });
-
-    // ── 3. Character-consistent keyframes (Flux 2 via fal.ai) ─────────────────
-    const imageKeys = await step.do(
-      "keyframes",
-      { retries: { limit: 3, delay: "15 seconds", backoff: "exponential" } },
-      async () => {
-        const keys: string[] = [];
-        for (let i = 0; i < story.scenes.length; i++) {
-          const scene = story.scenes[i]!;
-          const cast = story.characters
-            .filter((c) => scene.characters.includes(c.name))
-            .map((c) => `${c.name}: ${c.description}, palette ${JSON.stringify(c.palette)}`)
-            .join("; ");
-          const prompt = `Cute flat-vector cartoon for preschoolers, soft pastel colors, friendly rounded shapes, big eyes. ${scene.visual}. Characters — ${cast}. Setting: ${scene.setting}. No text overlays.`;
-          const res = await fetch("https://fal.run/fal-ai/flux-2", {
-            method: "POST",
-            headers: { Authorization: `Key ${this.env.FAL_API_KEY}`, "Content-Type": "application/json" },
-            body: JSON.stringify({ prompt, image_size: { width: 1920, height: 1080 } }),
-          });
-          if (!res.ok) throw new Error(`Flux2 ${res.status}: ${await res.text()}`);
-          const data = (await res.json()) as { images?: { url: string }[] };
-          const url = data.images?.[0]?.url;
-          if (!url) throw new Error("Flux2 returned no image");
-          const img = await (await fetch(url)).arrayBuffer();
-          const key = `${id}/images/scene-${String(i).padStart(2, "0")}.png`;
-          await r2Put(this.env.ARTIFACTS, key, img, "image/png");
-          keys.push(key);
+        // Feature 4: Duplicate guard — check if this topic was done in the last 90 days
+        const recent = await this.env.SERIES_MEMORY
+          .prepare("SELECT COUNT(*) as n FROM episodes WHERE topic = ? AND created_at > (unixepoch() - 7776000)")
+          .bind(row.topic)
+          .first<{ n: number }>();
+        if (recent && recent.n > 0) {
+          await this.env.SERIES_MEMORY
+            .prepare("UPDATE topics_queue SET used = 1, used_at = unixepoch() WHERE topic = ?")
+            .bind(row.topic)
+            .run();
+          const next = await this.env.SERIES_MEMORY
+            .prepare("SELECT topic FROM topics_queue WHERE used = 0 ORDER BY priority DESC, id ASC LIMIT 1")
+            .first<{ topic: string }>();
+          if (!next) throw new Error("Topic queue exhausted after duplicate skip");
+          return next.topic;
         }
-        return keys;
-      },
-    );
 
-    // ── 4. Animation — PixVerse V4.5 (cartoon/anime specialist) ──────────────
-    const clipKeys = await step.do(
-      "animate",
-      { retries: { limit: 3, delay: "30 seconds", backoff: "exponential" } },
-      async () => {
-        const keys: string[] = [];
-        for (let i = 0; i < imageKeys.length; i++) {
-          const imgObj = await this.env.ARTIFACTS.get(imageKeys[i]!);
-          if (!imgObj) throw new Error(`R2 image missing: ${imageKeys[i]}`);
-          const dataUri = `data:image/png;base64,${btoa(
-            String.fromCharCode(...new Uint8Array(await imgObj.arrayBuffer())),
-          )}`;
-          const res = await fetch("https://fal.run/fal-ai/pixverse/v4.5/image-to-video", {
+        return row.topic;
+      });
+
+      // ── 1. Story generation (Nous Hermes 4 — best creative writing) ──────────
+      const story = await step.do("story", async () => {
+        const raw = await openrouterChat(
+          this.env.OPENROUTER_API_KEY,
+          "nousresearch/hermes-4-405b",
+          "You are a warm, gentle children's Bible storyteller for ages 3-8. Return STRICT JSON only.",
+          `Write a 5-7 scene animated episode about: "${topic}".\n\nReturn JSON:\n{\n  "title": "catchy kid-friendly title (max 70 chars)",\n  "source": "Bible book/passage",\n  "lesson": "one gentle sentence moral",\n  "characters": [{"name":"...","description":"stable look","palette":{"skin":"#hex","hair":"#hex","robe":"#hex"}}],\n  "scenes": [{"narration":"1-2 short sentences","visual":"cartoon description","characters":["names"],"setting":"day|night|sunrise|indoor|water|desert"}]\n}`,
+          true,
+        );
+        return parseJson<StoryOutput>(raw);
+      });
+
+      // Feature 6: log story cost
+      await logCost(
+        this.env,
+        id,
+        "story",
+        "openrouter",
+        story.scenes.reduce((n, s) => n + s.narration.length + s.visual.length, 0),
+        "chars",
+        0.000008,
+      );
+
+      // ── 2. Safety gate ────────────────────────────────────────────────────────
+      await step.do("safety", async () => {
+        const text = story.scenes.map((s) => s.narration).join(" ").toLowerCase();
+        const banned = ["kill", "blood", "gore", "hell", "demon", "sexy", "violence", "weapon", "gun", "drug"];
+        const hit = banned.find((w) => text.includes(w));
+        if (hit) throw new Error(`Safety blocked: contains "${hit}"`);
+        const raw = await openrouterChat(
+          this.env.OPENROUTER_API_KEY,
+          "meta-llama/llama-3.3-70b-instruct",
+          "Strict content-safety reviewer for a preschool Bible channel.",
+          `Is this narration safe for ages 3-8? Reply JSON {"safe":bool,"reason":string}.\n\n${text}`,
+          true,
+        );
+        const v = parseJson<{ safe: boolean; reason: string }>(raw);
+        if (!v.safe) throw new Error(`Safety blocked: ${v.reason}`);
+      });
+
+      // ── 3. Character-consistent keyframes (Flux 2 via fal.ai) ─────────────────
+      const imageKeys = await step.do(
+        "keyframes",
+        { retries: { limit: 3, delay: "15 seconds", backoff: "exponential" } },
+        async () => {
+          const keys: string[] = [];
+          for (let i = 0; i < story.scenes.length; i++) {
+            const scene = story.scenes[i]!;
+            const cast = story.characters
+              .filter((c) => scene.characters.includes(c.name))
+              .map((c) => `${c.name}: ${c.description}, palette ${JSON.stringify(c.palette)}`)
+              .join("; ");
+            const prompt = `Cute flat-vector cartoon for preschoolers, soft pastel colors, friendly rounded shapes, big eyes. ${scene.visual}. Characters — ${cast}. Setting: ${scene.setting}. No text overlays.`;
+            const res = await fetch("https://fal.run/fal-ai/flux-2", {
+              method: "POST",
+              headers: { Authorization: `Key ${this.env.FAL_API_KEY}`, "Content-Type": "application/json" },
+              body: JSON.stringify({ prompt, image_size: { width: 1920, height: 1080 } }),
+            });
+            if (!res.ok) throw new Error(`Flux2 ${res.status}: ${await res.text()}`);
+            const data = (await res.json()) as { images?: { url: string }[] };
+            const url = data.images?.[0]?.url;
+            if (!url) throw new Error("Flux2 returned no image");
+            const img = await (await fetch(url)).arrayBuffer();
+            const key = `${id}/images/scene-${String(i).padStart(2, "0")}.png`;
+            await r2Put(this.env.ARTIFACTS, key, img, "image/png");
+            keys.push(key);
+          }
+          return keys;
+        },
+      );
+
+      // Feature 6: log keyframe cost
+      await logCost(this.env, id, "keyframes", "fal-flux2", imageKeys.length, "images", 0.05);
+
+      // ── 4. Animation — PixVerse V4.5 (cartoon/anime specialist) ──────────────
+      const clipKeys = await step.do(
+        "animate",
+        { retries: { limit: 3, delay: "30 seconds", backoff: "exponential" } },
+        async () => {
+          const keys: string[] = [];
+          for (let i = 0; i < imageKeys.length; i++) {
+            const imgObj = await this.env.ARTIFACTS.get(imageKeys[i]!);
+            if (!imgObj) throw new Error(`R2 image missing: ${imageKeys[i]}`);
+            const dataUri = `data:image/png;base64,${btoa(
+              String.fromCharCode(...new Uint8Array(await imgObj.arrayBuffer())),
+            )}`;
+            const res = await fetch("https://fal.run/fal-ai/pixverse/v4.5/image-to-video", {
+              method: "POST",
+              headers: { Authorization: `Key ${this.env.FAL_API_KEY}`, "Content-Type": "application/json" },
+              body: JSON.stringify({
+                image_url: dataUri,
+                prompt: "gentle cute cartoon motion, soft parallax, child-friendly, no camera shake",
+                duration: 6,
+                style: "cartoon",
+              }),
+            });
+            if (!res.ok) throw new Error(`PixVerse ${res.status}: ${await res.text()}`);
+            const data = (await res.json()) as { video?: { url: string } };
+            const url = data.video?.url;
+            if (!url) throw new Error("PixVerse returned no video");
+            const clip = await (await fetch(url)).arrayBuffer();
+            const key = `${id}/clips/scene-${String(i).padStart(2, "0")}.mp4`;
+            await r2Put(this.env.ARTIFACTS, key, clip, "video/mp4");
+            keys.push(key);
+          }
+          return keys;
+        },
+      );
+
+      // Feature 6: log animation cost
+      await logCost(this.env, id, "animate", "fal-pixverse", clipKeys.length, "clips", 0.15);
+
+      // ── 5. Voiceover — ElevenLabs Rachel (warm, natural for children) ─────────
+      const audioKeys = await step.do(
+        "voiceover",
+        { retries: { limit: 3, delay: "10 seconds", backoff: "exponential" } },
+        async () => {
+          const keys: string[] = [];
+          const voiceId = "21m00Tcm4TlvDq8ikWAM"; // Rachel
+          for (let i = 0; i < story.scenes.length; i++) {
+            const text = story.scenes[i]!.narration;
+            const res = await fetch(
+              `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=mp3_44100_128`,
+              {
+                method: "POST",
+                headers: { "xi-api-key": this.env.ELEVENLABS_API_KEY, "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  text,
+                  model_id: "eleven_multilingual_v2",
+                  voice_settings: { stability: 0.75, similarity_boost: 0.85, style: 0.3, use_speaker_boost: true },
+                }),
+              },
+            );
+            if (!res.ok) throw new Error(`ElevenLabs ${res.status}: ${await res.text()}`);
+            const key = `${id}/audio/scene-${String(i).padStart(2, "0")}.mp3`;
+            await r2Put(this.env.ARTIFACTS, key, await res.arrayBuffer(), "audio/mpeg");
+            keys.push(key);
+          }
+          return keys;
+        },
+      );
+
+      // Feature 6: log voiceover cost
+      const totalNarrationChars = story.scenes.reduce((n, s) => n + s.narration.length, 0);
+      await logCost(this.env, id, "voiceover", "elevenlabs", totalNarrationChars, "chars", 0.00003);
+
+      // ── 6. Music bed — Suno API ───────────────────────────────────────────────
+      const musicKey = await step.do(
+        "music",
+        { retries: { limit: 2, delay: "20 seconds", backoff: "exponential" } },
+        async () => {
+          const initRes = await fetch("https://api.suno.ai/api/generate", {
             method: "POST",
-            headers: { Authorization: `Key ${this.env.FAL_API_KEY}`, "Content-Type": "application/json" },
+            headers: { Authorization: `Bearer ${this.env.SUNO_API_KEY}`, "Content-Type": "application/json" },
             body: JSON.stringify({
-              image_url: dataUri,
-              prompt: "gentle cute cartoon motion, soft parallax, child-friendly, no camera shake",
-              duration: 6,
-              style: "cartoon",
+              prompt: `Gentle, uplifting instrumental children's background music for a Bible story about ${story.title}. Soft orchestral, warm, peaceful, no lyrics. 60 seconds.`,
+              make_instrumental: true,
+              wait_audio: true,
             }),
           });
-          if (!res.ok) throw new Error(`PixVerse ${res.status}: ${await res.text()}`);
-          const data = (await res.json()) as { video?: { url: string } };
-          const url = data.video?.url;
-          if (!url) throw new Error("PixVerse returned no video");
-          const clip = await (await fetch(url)).arrayBuffer();
-          const key = `${id}/clips/scene-${String(i).padStart(2, "0")}.mp4`;
-          await r2Put(this.env.ARTIFACTS, key, clip, "video/mp4");
-          keys.push(key);
-        }
-        return keys;
-      },
-    );
+          if (!initRes.ok) throw new Error(`Suno ${initRes.status}: ${await initRes.text()}`);
+          const data = (await initRes.json()) as Array<{ audio_url?: string }>;
+          const url = data[0]?.audio_url;
+          if (!url) throw new Error("Suno returned no audio URL");
+          const music = await (await fetch(url)).arrayBuffer();
+          const key = `${id}/audio/music.mp3`;
+          await r2Put(this.env.ARTIFACTS, key, music, "audio/mpeg");
+          return key;
+        },
+      );
 
-    // ── 5. Voiceover — ElevenLabs Rachel (warm, natural for children) ─────────
-    const audioKeys = await step.do(
-      "voiceover",
-      { retries: { limit: 3, delay: "10 seconds", backoff: "exponential" } },
-      async () => {
-        const keys: string[] = [];
-        const voiceId = "21m00Tcm4TlvDq8ikWAM"; // Rachel
-        for (let i = 0; i < story.scenes.length; i++) {
-          const text = story.scenes[i]!.narration;
-          const res = await fetch(
-            `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=mp3_44100_128`,
-            {
-              method: "POST",
-              headers: { "xi-api-key": this.env.ELEVENLABS_API_KEY, "Content-Type": "application/json" },
-              body: JSON.stringify({
-                text,
-                model_id: "eleven_multilingual_v2",
-                voice_settings: { stability: 0.75, similarity_boost: 0.85, style: 0.3, use_speaker_boost: true },
-              }),
+      // Feature 6: log music cost
+      await logCost(this.env, id, "music", "suno", 1, "generations", 0.01);
+
+      // ── 7. Assembly + thumbnail — Hetzner render box (ffmpeg) ─────────────────
+      const rendered = await step.do(
+        "assemble",
+        { timeout: "20 minutes", retries: { limit: 2, delay: "30 seconds", backoff: "exponential" } },
+        async () => {
+          const res = await fetch(`${this.env.RENDER_ENDPOINT}/assemble`, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${this.env.RENDER_TOKEN}`,
+              "Content-Type": "application/json",
             },
-          );
-          if (!res.ok) throw new Error(`ElevenLabs ${res.status}: ${await res.text()}`);
-          const key = `${id}/audio/scene-${String(i).padStart(2, "0")}.mp3`;
-          await r2Put(this.env.ARTIFACTS, key, await res.arrayBuffer(), "audio/mpeg");
-          keys.push(key);
-        }
-        return keys;
-      },
-    );
+            body: JSON.stringify({
+              id,
+              story,
+              clipKeys,
+              audioKeys,
+              musicKey,
+              imageKeys,
+              r2Bucket: "bible-story-artifacts",
+            }),
+          });
+          if (!res.ok) throw new Error(`Render service ${res.status}: ${await res.text()}`);
+          return (await res.json()) as RenderResult;
+        },
+      );
 
-    // ── 6. Music bed — Suno API ───────────────────────────────────────────────
-    const musicKey = await step.do(
-      "music",
-      { retries: { limit: 2, delay: "20 seconds", backoff: "exponential" } },
-      async () => {
-        const initRes = await fetch("https://api.suno.ai/api/generate", {
-          method: "POST",
-          headers: { Authorization: `Bearer ${this.env.SUNO_API_KEY}`, "Content-Type": "application/json" },
-          body: JSON.stringify({
-            prompt: `Gentle, uplifting instrumental children's background music for a Bible story about ${story.title}. Soft orchestral, warm, peaceful, no lyrics. 60 seconds.`,
-            make_instrumental: true,
-            wait_audio: true,
-          }),
-        });
-        if (!initRes.ok) throw new Error(`Suno ${initRes.status}: ${await initRes.text()}`);
-        const data = (await initRes.json()) as Array<{ audio_url?: string }>;
-        const url = data[0]?.audio_url;
-        if (!url) throw new Error("Suno returned no audio URL");
-        const music = await (await fetch(url)).arrayBuffer();
-        const key = `${id}/audio/music.mp3`;
-        await r2Put(this.env.ARTIFACTS, key, music, "audio/mpeg");
-        return key;
-      },
-    );
+      // ── 8. SEO metadata (Llama 3.3 — fast + structured) ──────────────────────
+      const metadata = await step.do("metadata", () => buildSEOMeta(this.env.OPENROUTER_API_KEY, story));
 
-    // ── 7. Assembly + thumbnail — Hetzner render box (ffmpeg) ─────────────────
-    const rendered = await step.do(
-      "assemble",
-      { timeout: "20 minutes", retries: { limit: 2, delay: "30 seconds", backoff: "exponential" } },
-      async () => {
-        const res = await fetch(`${this.env.RENDER_ENDPOINT}/assemble`, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${this.env.RENDER_TOKEN}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            id,
-            story,
-            clipKeys,
-            audioKeys,
-            musicKey,
-            imageKeys,
-            r2Bucket: "bible-story-artifacts",
-          }),
-        });
-        if (!res.ok) throw new Error(`Render service ${res.status}: ${await res.text()}`);
-        return (await res.json()) as RenderResult;
-      },
-    );
+      // ── 9. Record to D1 series memory ─────────────────────────────────────────
+      const initialStatus = this.env.REQUIRE_APPROVAL === "true" ? "awaiting_approval" : "assembled";
 
-    // ── 8. SEO metadata (Llama 3.3 — fast + structured) ──────────────────────
-    const metadata = await step.do("metadata", () => buildSEOMeta(this.env.OPENROUTER_API_KEY, story));
-
-    // ── 9. Record to D1 series memory ─────────────────────────────────────────
-    const initialStatus = this.env.REQUIRE_APPROVAL === "true" ? "awaiting_approval" : "assembled";
-
-    await step.do("record-episode", async () => {
-      await this.env.SERIES_MEMORY
-        .prepare("INSERT INTO episodes (id, title, source, lesson, topic, status, episode_mp4_key, thumbnail_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-        .bind(id, story.title, story.source, story.lesson, topic, initialStatus, rendered.episodeKey, rendered.thumbnailKey)
-        .run();
-      await this.env.SERIES_MEMORY
-        .prepare("UPDATE topics_queue SET used = 1, used_at = unixepoch() WHERE topic = ?")
-        .bind(topic)
-        .run();
-      for (const c of story.characters) {
+      await step.do("record-episode", async () => {
         await this.env.SERIES_MEMORY
-          .prepare("INSERT OR IGNORE INTO characters (id, name, description, palette_skin, palette_hair, palette_robe) VALUES (?, ?, ?, ?, ?, ?)")
-          .bind(crypto.randomUUID(), c.name, c.description, c.palette.skin, c.palette.hair, c.palette.robe)
+          .prepare("INSERT INTO episodes (id, title, source, lesson, topic, status, episode_mp4_key, thumbnail_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+          .bind(id, story.title, story.source, story.lesson, topic, initialStatus, rendered.episodeKey, rendered.thumbnailKey)
           .run();
+        await this.env.SERIES_MEMORY
+          .prepare("UPDATE topics_queue SET used = 1, used_at = unixepoch() WHERE topic = ?")
+          .bind(topic)
+          .run();
+        for (const c of story.characters) {
+          await this.env.SERIES_MEMORY
+            .prepare("INSERT OR IGNORE INTO characters (id, name, description, palette_skin, palette_hair, palette_robe) VALUES (?, ?, ?, ?, ?, ?)")
+            .bind(crypto.randomUUID(), c.name, c.description, c.palette.skin, c.palette.hair, c.palette.robe)
+            .run();
+        }
+      });
+
+      // Feature 3: Discord notification — awaiting approval
+      if (this.env.REQUIRE_APPROVAL === "true") {
+        await notify(
+          this.env,
+          `🎬 Episode assembled: **${story.title}** — awaiting approval\nPOST /approve/${id}`,
+          0xfaa61a,
+        );
+        return {
+          id,
+          topic,
+          title: story.title,
+          status: "awaiting_approval",
+          note: `POST /approve/${id}  (Bearer RENDER_TOKEN) to publish to YouTube`,
+        };
       }
-    });
 
-    // ── 10. Publish to YouTube — or hold for approval ─────────────────────────
-    if (this.env.REQUIRE_APPROVAL === "true") {
-      return {
-        id,
-        topic,
-        title: story.title,
-        status: "awaiting_approval",
-        note: `POST /approve/${id}  (Bearer RENDER_TOKEN) to publish to YouTube`,
-      };
+      // ── 10. Publish to YouTube — or hold for approval ─────────────────────────
+      const published = await step.do(
+        "publish",
+        { retries: { limit: 2, delay: "30 seconds", backoff: "exponential" } },
+        () => publishToYouTube(this.env, rendered.episodeKey, metadata),
+      );
+
+      // ── 11. Update D1 with YouTube info ──────────────────────────────────────
+      await step.do("update-episode-record", async () => {
+        await this.env.SERIES_MEMORY
+          .prepare("UPDATE episodes SET status = 'published', youtube_id = ?, youtube_url = ?, youtube_privacy = 'unlisted', published_at = unixepoch() WHERE id = ?")
+          .bind(published.youtubeId, published.url, id)
+          .run();
+      });
+
+      // Feature 3: Discord notification — published
+      await notify(
+        this.env,
+        `✅ Published: **${story.title}**\n${published.url}`,
+        0x57f287,
+      );
+
+      return { id, topic, title: story.title, ...published };
+    } catch (err) {
+      // Feature 3: Discord notification — failure
+      await notify(
+        this.env,
+        `❌ Workflow failed: ${id}\n${String(err)}`,
+        0xed4245,
+      );
+      throw err;
     }
+  }
+}
 
-    const published = await step.do(
-      "publish",
-      { retries: { limit: 2, delay: "30 seconds", backoff: "exponential" } },
-      () => publishToYouTube(this.env, rendered.episodeKey, metadata),
-    );
+// ─── Feature 5: Shorts Workflow ───────────────────────────────────────────────
 
-    // ── 11. Update D1 with YouTube info ──────────────────────────────────────
-    await step.do("update-episode-record", async () => {
-      await this.env.SERIES_MEMORY
-        .prepare("UPDATE episodes SET status = 'published', youtube_id = ?, youtube_url = ?, youtube_privacy = 'unlisted', published_at = unixepoch() WHERE id = ?")
-        .bind(published.youtubeId, published.url, id)
-        .run();
-    });
+export class ShortsWorkflow extends WorkflowEntrypoint<Env, ShortsParams> {
+  async run(event: WorkflowEvent<ShortsParams>, step: WorkflowStep): Promise<unknown> {
+    const id = event.instanceId;
 
-    return { id, topic, title: story.title, ...published };
+    try {
+      let story: StoryOutput;
+      let audioKeys: string[];
+      let topic: string;
+
+      if (event.payload.episodeId) {
+        // Reuse story + audio from existing episode
+        const episodeId = event.payload.episodeId;
+        const existing = await step.do("load-episode", async () => {
+          const row = await this.env.SERIES_MEMORY
+            .prepare("SELECT * FROM episodes WHERE id = ?")
+            .bind(episodeId)
+            .first<EpisodeRow>();
+          if (!row) throw new Error(`Episode not found: ${episodeId}`);
+          return row;
+        });
+
+        topic = existing.topic;
+
+        // Re-generate story from topic (since we can't serialise the full object cross-run)
+        story = await step.do("story", async () => {
+          const raw = await openrouterChat(
+            this.env.OPENROUTER_API_KEY,
+            "nousresearch/hermes-4-405b",
+            "You are a warm, gentle children's Bible storyteller for ages 3-8. Return STRICT JSON only.",
+            `Write a 3-scene SHORT animated episode (under 60 seconds) about: "${existing.topic}".\n\nReturn JSON:\n{\n  "title": "catchy kid-friendly title (max 70 chars)",\n  "source": "Bible book/passage",\n  "lesson": "one gentle sentence moral",\n  "characters": [{"name":"...","description":"stable look","palette":{"skin":"#hex","hair":"#hex","robe":"#hex"}}],\n  "scenes": [{"narration":"1 short sentence","visual":"cartoon description","characters":["names"],"setting":"day|night|sunrise|indoor|water|desert"}]\n}`,
+            true,
+          );
+          return parseJson<StoryOutput>(raw);
+        });
+
+        // Use existing audio keys from the parent episode (first 3 scenes)
+        audioKeys = [];
+        for (let i = 0; i < Math.min(3, story.scenes.length); i++) {
+          audioKeys.push(`${episodeId}/audio/scene-${String(i).padStart(2, "0")}.mp3`);
+        }
+      } else {
+        // Generate fresh
+        topic = await step.do("pick-topic", async () => {
+          if (event.payload.topic) return event.payload.topic;
+          const row = await this.env.SERIES_MEMORY
+            .prepare("SELECT topic FROM topics_queue WHERE used = 0 ORDER BY priority DESC, id ASC LIMIT 1")
+            .first<{ topic: string }>();
+          if (!row) throw new Error("Topic queue is empty");
+          return row.topic;
+        });
+
+        story = await step.do("story", async () => {
+          const raw = await openrouterChat(
+            this.env.OPENROUTER_API_KEY,
+            "nousresearch/hermes-4-405b",
+            "You are a warm, gentle children's Bible storyteller for ages 3-8. Return STRICT JSON only.",
+            `Write a 3-scene SHORT animated episode (under 60 seconds total) about: "${topic}".\n\nReturn JSON:\n{\n  "title": "catchy kid-friendly title (max 70 chars)",\n  "source": "Bible book/passage",\n  "lesson": "one gentle sentence moral",\n  "characters": [{"name":"...","description":"stable look","palette":{"skin":"#hex","hair":"#hex","robe":"#hex"}}],\n  "scenes": [{"narration":"1 short sentence","visual":"cartoon description","characters":["names"],"setting":"day|night|sunrise|indoor|water|desert"}]\n}`,
+            true,
+          );
+          return parseJson<StoryOutput>(raw);
+        });
+
+        // Voiceover for fresh short
+        audioKeys = await step.do(
+          "voiceover",
+          { retries: { limit: 3, delay: "10 seconds", backoff: "exponential" } },
+          async () => {
+            const keys: string[] = [];
+            const voiceId = "21m00Tcm4TlvDq8ikWAM";
+            for (let i = 0; i < Math.min(3, story.scenes.length); i++) {
+              const text = story.scenes[i]!.narration;
+              const res = await fetch(
+                `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=mp3_44100_128`,
+                {
+                  method: "POST",
+                  headers: { "xi-api-key": this.env.ELEVENLABS_API_KEY, "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    text,
+                    model_id: "eleven_multilingual_v2",
+                    voice_settings: { stability: 0.75, similarity_boost: 0.85, style: 0.3, use_speaker_boost: true },
+                  }),
+                },
+              );
+              if (!res.ok) throw new Error(`ElevenLabs ${res.status}: ${await res.text()}`);
+              const key = `${id}/audio/scene-${String(i).padStart(2, "0")}.mp3`;
+              await r2Put(this.env.ARTIFACTS, key, await res.arrayBuffer(), "audio/mpeg");
+              keys.push(key);
+            }
+            return keys;
+          },
+        );
+      }
+
+      // Limit to first 3 scenes for Shorts
+      const shortScenes = story.scenes.slice(0, 3);
+      const shortStory: StoryOutput = { ...story, scenes: shortScenes };
+
+      // Portrait keyframes (1080x1920)
+      const imageKeys = await step.do(
+        "keyframes",
+        { retries: { limit: 3, delay: "15 seconds", backoff: "exponential" } },
+        async () => {
+          const keys: string[] = [];
+          for (let i = 0; i < shortScenes.length; i++) {
+            const scene = shortScenes[i]!;
+            const cast = shortStory.characters
+              .filter((c) => scene.characters.includes(c.name))
+              .map((c) => `${c.name}: ${c.description}, palette ${JSON.stringify(c.palette)}`)
+              .join("; ");
+            const prompt = `Cute flat-vector cartoon for preschoolers, soft pastel colors, friendly rounded shapes, big eyes. PORTRAIT orientation for YouTube Shorts. ${scene.visual}. Characters — ${cast}. Setting: ${scene.setting}. No text overlays.`;
+            const res = await fetch("https://fal.run/fal-ai/flux-2", {
+              method: "POST",
+              headers: { Authorization: `Key ${this.env.FAL_API_KEY}`, "Content-Type": "application/json" },
+              body: JSON.stringify({ prompt, image_size: { width: 1080, height: 1920 } }),
+            });
+            if (!res.ok) throw new Error(`Flux2 ${res.status}: ${await res.text()}`);
+            const data = (await res.json()) as { images?: { url: string }[] };
+            const url = data.images?.[0]?.url;
+            if (!url) throw new Error("Flux2 returned no image");
+            const img = await (await fetch(url)).arrayBuffer();
+            const key = `${id}/shorts/images/scene-${String(i).padStart(2, "0")}.png`;
+            await r2Put(this.env.ARTIFACTS, key, img, "image/png");
+            keys.push(key);
+          }
+          return keys;
+        },
+      );
+
+      // Vertical clips (9:16)
+      const clipKeys = await step.do(
+        "animate",
+        { retries: { limit: 3, delay: "30 seconds", backoff: "exponential" } },
+        async () => {
+          const keys: string[] = [];
+          for (let i = 0; i < imageKeys.length; i++) {
+            const imgObj = await this.env.ARTIFACTS.get(imageKeys[i]!);
+            if (!imgObj) throw new Error(`R2 image missing: ${imageKeys[i]}`);
+            const dataUri = `data:image/png;base64,${btoa(
+              String.fromCharCode(...new Uint8Array(await imgObj.arrayBuffer())),
+            )}`;
+            const res = await fetch("https://fal.run/fal-ai/pixverse/v4.5/image-to-video", {
+              method: "POST",
+              headers: { Authorization: `Key ${this.env.FAL_API_KEY}`, "Content-Type": "application/json" },
+              body: JSON.stringify({
+                image_url: dataUri,
+                prompt: "gentle cute cartoon motion, soft parallax, child-friendly, no camera shake",
+                duration: 6,
+                style: "cartoon",
+                aspect_ratio: "9:16",
+              }),
+            });
+            if (!res.ok) throw new Error(`PixVerse ${res.status}: ${await res.text()}`);
+            const data = (await res.json()) as { video?: { url: string } };
+            const url = data.video?.url;
+            if (!url) throw new Error("PixVerse returned no video");
+            const clip = await (await fetch(url)).arrayBuffer();
+            const key = `${id}/shorts/clips/scene-${String(i).padStart(2, "0")}.mp4`;
+            await r2Put(this.env.ARTIFACTS, key, clip, "video/mp4");
+            keys.push(key);
+          }
+          return keys;
+        },
+      );
+
+      // Music
+      const musicKey = await step.do(
+        "music",
+        { retries: { limit: 2, delay: "20 seconds", backoff: "exponential" } },
+        async () => {
+          const initRes = await fetch("https://api.suno.ai/api/generate", {
+            method: "POST",
+            headers: { Authorization: `Bearer ${this.env.SUNO_API_KEY}`, "Content-Type": "application/json" },
+            body: JSON.stringify({
+              prompt: `Gentle, uplifting instrumental children's background music for a Bible story about ${shortStory.title}. Soft orchestral, warm, peaceful, no lyrics. 30 seconds.`,
+              make_instrumental: true,
+              wait_audio: true,
+            }),
+          });
+          if (!initRes.ok) throw new Error(`Suno ${initRes.status}: ${await initRes.text()}`);
+          const data = (await initRes.json()) as Array<{ audio_url?: string }>;
+          const url = data[0]?.audio_url;
+          if (!url) throw new Error("Suno returned no audio URL");
+          const music = await (await fetch(url)).arrayBuffer();
+          const key = `${id}/shorts/audio/music.mp3`;
+          await r2Put(this.env.ARTIFACTS, key, music, "audio/mpeg");
+          return key;
+        },
+      );
+
+      // Assemble short via /assemble-short
+      const rendered = await step.do(
+        "assemble",
+        { timeout: "20 minutes", retries: { limit: 2, delay: "30 seconds", backoff: "exponential" } },
+        async () => {
+          const res = await fetch(`${this.env.RENDER_ENDPOINT}/assemble-short`, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${this.env.RENDER_TOKEN}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              id,
+              story: shortStory,
+              clipKeys,
+              audioKeys: audioKeys.slice(0, 3),
+              musicKey,
+              imageKeys,
+              r2Bucket: "bible-story-artifacts",
+              format: "short",
+            }),
+          });
+          if (!res.ok) throw new Error(`Render service ${res.status}: ${await res.text()}`);
+          return (await res.json()) as RenderResult;
+        },
+      );
+
+      // SEO metadata (append #Shorts)
+      const metadata = await step.do("metadata", async () => {
+        const meta = await buildSEOMeta(this.env.OPENROUTER_API_KEY, shortStory);
+        return {
+          ...meta,
+          title: `${meta.title.slice(0, 93)} #Shorts`,
+        };
+      });
+
+      // Record to D1
+      await step.do("record-episode", async () => {
+        await this.env.SERIES_MEMORY
+          .prepare("INSERT INTO episodes (id, title, source, lesson, topic, status, episode_mp4_key, thumbnail_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+          .bind(id, metadata.title, shortStory.source, shortStory.lesson, topic, "assembled", rendered.episodeKey, rendered.thumbnailKey)
+          .run();
+      });
+
+      // Publish
+      const published = await step.do(
+        "publish",
+        { retries: { limit: 2, delay: "30 seconds", backoff: "exponential" } },
+        () => publishToYouTube(this.env, rendered.episodeKey, metadata),
+      );
+
+      await step.do("update-episode-record", async () => {
+        await this.env.SERIES_MEMORY
+          .prepare("UPDATE episodes SET status = 'published', youtube_id = ?, youtube_url = ?, youtube_privacy = 'unlisted', published_at = unixepoch() WHERE id = ?")
+          .bind(published.youtubeId, published.url, id)
+          .run();
+      });
+
+      await notify(
+        this.env,
+        `🩳 Short published: **${metadata.title}**\n${published.url}`,
+        0x57f287,
+      );
+
+      return { id, topic, title: metadata.title, format: "short", ...published };
+    } catch (err) {
+      await notify(
+        this.env,
+        `❌ Shorts workflow failed: ${id}\n${String(err)}`,
+        0xed4245,
+      );
+      throw err;
+    }
   }
 }
 
 // ─── Scheduled + HTTP handlers ───────────────────────────────────────────────
 
 export default {
-  // Daily cron: picks next topic from D1 queue automatically.
-  async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
+  async scheduled(controller: ScheduledController, env: Env): Promise<void> {
+    if (controller.cron === "0 20 * * *") {
+      // Feature 2: Auto-promote unlisted → public
+      await autoPromote(env);
+      return;
+    }
+
+    if (controller.cron === "0 16 * * *") {
+      // Feature 5: Daily Shorts
+      await env.SHORTS_WORKFLOW.create({ params: {} });
+      return;
+    }
+
+    // Default: 0 15 * * * — daily episode
     await env.STUDIO_WORKFLOW.create({ params: {} });
+
+    // Feature 4: auto-generate topics if queue is low
+    const remaining = await env.SERIES_MEMORY
+      .prepare("SELECT COUNT(*) as n FROM topics_queue WHERE used = 0")
+      .first<{ n: number }>();
+    if (remaining && remaining.n < 10) {
+      await autoGenerateTopics(env).catch(() => {});
+    }
   },
 
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
 
+    // Handle CORS preflight
+    if (req.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: corsHeaders() });
+    }
+
     // POST /run  {"topic": "..."} — manual trigger (topic optional)
     if (req.method === "POST" && url.pathname === "/run") {
       const body = (await req.json().catch(() => ({}))) as { topic?: string };
       const instance = await env.STUDIO_WORKFLOW.create({ params: { topic: body.topic } });
-      return Response.json({ instanceId: instance.id, topic: body.topic ?? "(auto from queue)" });
+      return jsonResponse({ instanceId: instance.id, topic: body.topic ?? "(auto from queue)" });
+    }
+
+    // POST /run-short  {"topic": "...", "episodeId": "..."} — manual Shorts trigger
+    if (req.method === "POST" && url.pathname === "/run-short") {
+      const auth = req.headers.get("Authorization");
+      if (!auth || auth !== `Bearer ${env.RENDER_TOKEN}`) {
+        return new Response("Unauthorized", { status: 401, headers: corsHeaders() });
+      }
+      const body = (await req.json().catch(() => ({}))) as ShortsParams;
+      const instance = await env.SHORTS_WORKFLOW.create({ params: body });
+      return jsonResponse({ instanceId: instance.id });
     }
 
     // GET /queue — list topic queue
@@ -487,15 +1030,15 @@ export default {
       const rows = await env.SERIES_MEMORY
         .prepare("SELECT topic, priority, used, used_at FROM topics_queue ORDER BY used ASC, priority DESC")
         .all();
-      return Response.json(rows.results);
+      return jsonResponse(rows.results);
     }
 
     // GET /episodes — recent episode list
     if (req.method === "GET" && url.pathname === "/episodes") {
       const rows = await env.SERIES_MEMORY
-        .prepare("SELECT id, title, source, status, youtube_url, datetime(created_at,'unixepoch') as created FROM episodes ORDER BY created_at DESC LIMIT 50")
+        .prepare("SELECT id, title, source, status, youtube_url, youtube_privacy, datetime(created_at,'unixepoch') as created FROM episodes ORDER BY created_at DESC LIMIT 50")
         .all();
-      return Response.json(rows.results);
+      return jsonResponse(rows.results);
     }
 
     // GET /status/:id — full episode record
@@ -505,22 +1048,22 @@ export default {
         .prepare("SELECT * FROM episodes WHERE id = ?")
         .bind(epId)
         .first<EpisodeRow>();
-      if (!row) return new Response("Episode not found", { status: 404 });
-      return Response.json(row);
+      if (!row) return new Response("Episode not found", { status: 404, headers: corsHeaders() });
+      return jsonResponse(row);
     }
 
     // POST /approve/:id — publish a held episode to YouTube (requires Bearer RENDER_TOKEN)
     if (req.method === "POST" && url.pathname.startsWith("/approve/")) {
       const auth = req.headers.get("Authorization");
       if (!auth || auth !== `Bearer ${env.RENDER_TOKEN}`) {
-        return new Response("Unauthorized", { status: 401 });
+        return new Response("Unauthorized", { status: 401, headers: corsHeaders() });
       }
       const epId = url.pathname.slice("/approve/".length);
       const row = await env.SERIES_MEMORY
         .prepare("SELECT id, title, source, lesson, episode_mp4_key FROM episodes WHERE id = ? AND status = 'awaiting_approval'")
         .bind(epId)
         .first<Pick<EpisodeRow, "id" | "title" | "source" | "lesson" | "episode_mp4_key">>();
-      if (!row) return new Response("Episode not found or not awaiting approval", { status: 404 });
+      if (!row) return new Response("Episode not found or not awaiting approval", { status: 404, headers: corsHeaders() });
 
       const meta = await buildSEOMeta(env.OPENROUTER_API_KEY, row);
       const published = await publishToYouTube(env, row.episode_mp4_key, meta);
@@ -530,20 +1073,66 @@ export default {
         .bind(published.youtubeId, published.url, epId)
         .run();
 
-      return Response.json({ id: epId, title: row.title, ...published });
+      await notify(
+        env,
+        `✅ Manually approved & published: **${row.title}**\n${published.url}`,
+        0x57f287,
+      );
+
+      return jsonResponse({ id: epId, title: row.title, ...published });
     }
 
-    return new Response(
-      [
-        "Bible Videos for Kids",
-        "",
-        "POST  /run              trigger episode (body: {topic?})",
-        "GET   /queue            topic queue",
-        "GET   /episodes         recent episodes",
-        "GET   /status/:id       episode details",
-        "POST  /approve/:id      publish held episode (Bearer RENDER_TOKEN)",
-      ].join("\n"),
-      { status: 200, headers: { "Content-Type": "text/plain" } },
+    // Feature 4: POST /topics/generate — manually trigger topic auto-generation
+    if (req.method === "POST" && url.pathname === "/topics/generate") {
+      const auth = req.headers.get("Authorization");
+      if (!auth || auth !== `Bearer ${env.RENDER_TOKEN}`) {
+        return new Response("Unauthorized", { status: 401, headers: corsHeaders() });
+      }
+      try {
+        const topics = await autoGenerateTopics(env);
+        return jsonResponse({ topics, count: topics.length });
+      } catch (err) {
+        return jsonResponse({ error: String(err) }, 500);
+      }
+    }
+
+    // Feature 6: GET /costs/:episodeId
+    if (req.method === "GET" && url.pathname.startsWith("/costs/") && url.pathname !== "/costs/summary") {
+      const epId = url.pathname.slice("/costs/".length);
+      const rows = await env.SERIES_MEMORY
+        .prepare("SELECT * FROM costs WHERE episode_id = ? ORDER BY stage")
+        .bind(epId)
+        .all();
+      return jsonResponse(rows.results);
+    }
+
+    // Feature 6: GET /costs/summary
+    if (req.method === "GET" && url.pathname === "/costs/summary") {
+      const rows = await env.SERIES_MEMORY
+        .prepare(
+          "SELECT SUM(total_usd) as total, strftime('%Y-%m', datetime(recorded_at,'unixepoch')) as month FROM costs GROUP BY month ORDER BY month DESC LIMIT 12",
+        )
+        .all();
+      return jsonResponse(rows.results);
+    }
+
+    return withCors(
+      new Response(
+        [
+          "Bible Videos for Kids",
+          "",
+          "POST  /run                 trigger episode (body: {topic?})",
+          "POST  /run-short           trigger short (body: {topic?, episodeId?}) [Bearer]",
+          "GET   /queue               topic queue",
+          "GET   /episodes            recent episodes",
+          "GET   /status/:id          episode details",
+          "POST  /approve/:id         publish held episode [Bearer]",
+          "POST  /topics/generate     auto-generate topics [Bearer]",
+          "GET   /costs/:episodeId    cost breakdown for episode",
+          "GET   /costs/summary       monthly cost summary",
+        ].join("\n"),
+        { status: 200, headers: { "Content-Type": "text/plain" } },
+      ),
     );
   },
 };

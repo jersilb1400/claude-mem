@@ -42,6 +42,21 @@ CREATE TABLE IF NOT EXISTS topics_queue (
   used_at  INTEGER
 );
 
+-- Feature 6: Cost ledger — tracks spend per stage per episode
+CREATE TABLE IF NOT EXISTS costs (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  episode_id  TEXT    NOT NULL,
+  stage       TEXT    NOT NULL,
+  provider    TEXT    NOT NULL,
+  units       REAL    NOT NULL,
+  unit_type   TEXT    NOT NULL,
+  rate_usd    REAL    NOT NULL,
+  total_usd   REAL    NOT NULL,
+  recorded_at INTEGER DEFAULT (unixepoch())
+);
+CREATE INDEX IF NOT EXISTS costs_episode_idx ON costs(episode_id);
+CREATE INDEX IF NOT EXISTS costs_recorded_idx ON costs(recorded_at);
+
 -- Seed topics (already applied; safe to re-run due to INSERT OR IGNORE)
 INSERT OR IGNORE INTO topics_queue (topic, priority) VALUES
   ('Noah and the Great Flood',                    10),

@@ -51,6 +51,8 @@ set_secret "YOUTUBE_REFRESH_TOKEN"  "required — run 'make youtube-oauth' to ob
 echo "── Optional ──────────────────────────────────────────────"
 echo ""
 set_secret "REQUIRE_APPROVAL"       "optional — set to 'true' to hold episodes before publishing"
+set_secret "DISCORD_WEBHOOK"        "optional — Discord webhook URL for pipeline notifications"
+set_secret "PROMOTE_AFTER_HOURS"    "optional — hours before unlisted→public promotion (default 24)"
 
 echo "╔══════════════════════════════════════════╗"
 echo "║  ✅  Secrets setup complete!             ║"
