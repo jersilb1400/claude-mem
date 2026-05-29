@@ -17,17 +17,28 @@ Target audience: children ages 3–8. Content must be gentle, joyful, and safe f
 
 ---
 
-## Quick-start
+## Quick-start (Cloudflare + Hetzner production)
+
+```bash
+make deploy          # install Wrangler + apply D1 schema + deploy Worker
+make secrets         # interactive: set all API keys via wrangler secret put
+make topics          # insert 60 Bible story topics into D1
+make monitor         # view episode status, queue, render service health
+make run             # trigger one episode manually (set WORKER_URL first)
+make typecheck       # TypeScript check (worker + render service)
+```
+
+**Prerequisites:** Node ≥ 20, Bun, `wrangler` (installed by `make deploy`).
+
+### Local offline pipeline (no keys needed)
 
 ```bash
 npm install
-npm run run -- --topic "Noah's Ark"          # full run (offline, no keys needed)
-npm run run -- --topic "David and Goliath" --no-publish  # skip YouTube upload
-npm run typecheck                              # must pass before any PR
-npm test                                       # unit tests + full offline pipeline → episode.mp4
+npm run run -- --topic "Noah's Ark"          # full offline run → episode.mp4
+npm run typecheck && npm test
 ```
 
-**Hard requirements:** Node ≥ 20 and `ffmpeg`/`ffprobe` on `PATH`. No build step — everything runs via `tsx`.
+**Hard requirements:** Node ≥ 20 and `ffmpeg`/`ffprobe` on `PATH`. No build step — runs via `tsx`.
 
 ---
 
@@ -147,8 +158,32 @@ bible-story-studio/          ← repo root when deployed to Bible-Videos-for-Kid
 │       ├── ffmpeg.ts        ffmpeg/ffprobe helpers + caption escaping utilities
 │       └── youtube.ts       YouTube Data API v3 resumable upload (fetch-only)
 ├── cloudflare/
-│   ├── worker.ts            Cloudflare Workflows control plane (deployable skeleton)
-│   └── wrangler.jsonc       Wrangler config: Workflow, R2, Cron Trigger
+│   ├── worker.ts            Full Workflows control plane (all 11 steps, approval gate)
+│   ├── wrangler.jsonc       Wrangler config: Workflow, R2, D1, Cron Trigger
+│   ├── schema.sql           D1 schema + 20 seed topics (idempotent, safe to re-run)
+│   ├── package.json         Wrangler + @cloudflare/workers-types
+│   └── tsconfig.json        Worker TypeScript config
+├── render-service/
+│   ├── server.ts            Hono HTTP server (port 3001, graceful SIGTERM)
+│   ├── assemble.ts          Core ffmpeg assembly: captions + mux + music + thumbnail
+│   ├── r2.ts                S3-compatible R2 download/upload helpers
+│   ├── ffmpeg.ts            ffmpeg/ffprobe spawn helpers + caption wrap
+│   ├── types.ts             AssembleRequest / AssembleResult interfaces
+│   ├── package.json         hono + @aws-sdk/client-s3
+│   ├── tsconfig.json        Bun-compatible TypeScript config
+│   ├── ecosystem.config.cjs PM2 config (name: bible-render)
+│   ├── .env.example         Port, RENDER_TOKEN, R2 credentials
+│   └── setup.sh             One-shot Hetzner Ubuntu setup (ffmpeg, Bun, PM2)
+├── scripts/
+│   ├── deploy.sh            One-shot deploy (schema + worker)
+│   ├── secrets.sh           Interactive wrangler secret put for all keys
+│   ├── youtube-oauth.ts     OAuth2 refresh token helper (Bun)
+│   ├── setup-tunnel.sh      Cloudflare Tunnel setup for Hetzner
+│   ├── monitor.sh           Episode status + queue + render health
+│   └── add-topics.ts        Bulk topic insertion (60 curated stories)
+├── .github/
+│   └── workflows/deploy.yml Auto-deploy Worker on push to main
+├── Makefile                 Developer shortcuts (deploy, secrets, monitor, run, topics)
 ├── test/
 │   └── pipeline.test.ts     Unit tests + full offline end-to-end run → mp4
 ├── .env.example             All env vars with explanations
@@ -198,24 +233,74 @@ upload-manifest.json what would be sent to YouTube (mock mode)
 
 ---
 
-## Cloudflare production deployment
-
-See `cloudflare/worker.ts` and `ARCHITECTURE.md` for the full setup. High-level:
+## Cloudflare + Hetzner production deployment
 
 ```
-Cloudflare Cron (daily) → Workflow (durable, checkpointed, R2 artifacts)
-  step: story/safety/metadata  → OpenRouter (Nous Hermes + Llama 3.3 70B)
-  step: keyframes              → fal.ai Flux 2  (or Hetzner ComfyUI)
-  step: animate                → fal.ai PixVerse V4.5  (or Hetzner Wan 2.7)
-  step: voiceover              → ElevenLabs  (or self-hosted Kokoro)
-  step: assemble (ffmpeg)      → Hetzner render box  ← can't run in Worker
-  step: publish                → YouTube Data API v3
+Cloudflare Cron (0 15 * * *) → StudioWorkflow (durable, checkpointed)
+  step 0:  pick topic         → D1 topics_queue
+  step 1:  story              → OpenRouter Nous Hermes 4 405B
+  step 2:  safety gate        → keyword blocklist + Llama 3.3 70B
+  step 3:  keyframes          → fal.ai Flux 2  (character-consistent)
+  step 4:  animate            → fal.ai PixVerse V4.5  (cartoon style)
+  step 5:  voiceover          → ElevenLabs Rachel  (11_multilingual_v2)
+  step 6:  music              → Suno API  (instrumental)
+  step 7:  assemble           → Hetzner render service  (ffmpeg, can't run in Worker)
+  step 8:  SEO metadata       → Llama 3.3 70B
+  step 9:  record to D1       → series memory + character library
+  step 10: publish            → YouTube Data API v3  (or hold if REQUIRE_APPROVAL=true)
 ```
 
-Secrets set via `npx wrangler secret put <NAME>`:
-`OPENROUTER_API_KEY`, `FAL_API_KEY`, `ELEVENLABS_API_KEY`,
-`RENDER_ENDPOINT`, `RENDER_TOKEN`,
-`YOUTUBE_CLIENT_ID`, `YOUTUBE_CLIENT_SECRET`, `YOUTUBE_REFRESH_TOKEN`
+### First-time setup
+
+```bash
+# 1. Deploy the Worker
+make deploy
+
+# 2. Set all secrets
+make secrets
+
+# 3. Seed Bible story topics
+make topics
+
+# 4. Provision Hetzner server (CX21 or higher)
+#    SSH into the box, clone this repo, then:
+bash render-service/setup.sh
+# Fill in render-service/.env, then:
+pm2 start render-service/ecosystem.config.cjs && pm2 save && pm2 startup
+
+# 5. Expose render service via Cloudflare Tunnel
+bash scripts/setup-tunnel.sh  # run on Hetzner box
+
+# 6. Get YouTube refresh token (run on your laptop)
+make youtube-oauth YOUTUBE_CLIENT_ID=xxx YOUTUBE_CLIENT_SECRET=yyy
+
+# 7. Monitor
+make monitor
+```
+
+### Wrangler secrets reference
+
+| Secret | Source |
+|--------|--------|
+| `OPENROUTER_API_KEY` | openrouter.ai → Keys |
+| `FAL_API_KEY` | fal.ai → API Keys |
+| `ELEVENLABS_API_KEY` | elevenlabs.io → Profile → API Keys |
+| `SUNO_API_KEY` | suno.ai → Settings |
+| `RENDER_TOKEN` | any strong random string (same in render-service/.env) |
+| `RENDER_ENDPOINT` | your tunnel hostname, e.g. `https://render.yourdomain.com` |
+| `YOUTUBE_CLIENT_ID` | Google Cloud Console → Desktop app credential |
+| `YOUTUBE_CLIENT_SECRET` | same credential |
+| `YOUTUBE_REFRESH_TOKEN` | run `make youtube-oauth` |
+| `REQUIRE_APPROVAL` | optional — set `true` to hold before publish |
+
+### R2 API token (for render service)
+
+Cloudflare Dashboard → R2 → Manage R2 API Tokens → Create Token (read + write on `bible-story-artifacts`). Put values in `render-service/.env`.
+
+### CI/CD — auto-deploy on push
+
+`.github/workflows/deploy.yml` deploys the Worker whenever `cloudflare/` changes on `main`.  
+Add `CLOUDFLARE_API_TOKEN` as a GitHub repository secret (Cloudflare Dashboard → User API Tokens → "Edit Cloudflare Workers" template).
 
 ---
 
@@ -230,10 +315,24 @@ Secrets set via `npx wrangler secret put <NAME>`:
 
 ---
 
+## Scripts reference
+
+| Script | What it does |
+|--------|-------------|
+| `scripts/deploy.sh` | `npm install` → `wrangler d1 execute schema.sql` → `wrangler deploy` |
+| `scripts/secrets.sh` | Interactive prompts → `wrangler secret put` for each key |
+| `scripts/youtube-oauth.ts` | Local OAuth2 server → exchanges code → prints refresh token |
+| `scripts/setup-tunnel.sh` | Installs cloudflared + registers as system service on Hetzner |
+| `scripts/monitor.sh` | D1 recent episodes + queue stats + render service health |
+| `scripts/add-topics.ts` | Inserts 60 curated Bible topics into D1 (`--preview` to list first) |
+
+---
+
 ## Gotchas
 
-- `ffmpeg` and `ffprobe` must be installed and on `PATH`. Their absence breaks media stages even in offline mode — install them first.
-- `cloudflare/worker.ts` provider bodies are **stubbed with `throw new Error("wire up ... here")`** — it is a deployable skeleton, not a finished worker.
-- `ffmpeg` cannot run inside a Cloudflare Worker. In production `assemble` calls out to a small HTTP service on Hetzner (or a Cloudflare Container) running the same code from `src/stages/assemble.ts`.
-- Imports must end in `.js` even though the source files are `.ts`. This is an ESM/NodeNext requirement — do not remove the extensions.
+- `ffmpeg` and `ffprobe` must be on `PATH` on the Hetzner box. `render-service/setup.sh` installs them via apt.
+- `ffmpeg` cannot run inside a Cloudflare Worker — that is why `render-service/` exists as a separate Hetzner HTTP service.
+- Approval mode: set `REQUIRE_APPROVAL=true` as a Wrangler secret. Episodes stop at status `awaiting_approval`. Publish with `POST /approve/:id` (Bearer `RENDER_TOKEN`).
+- Imports in `src/` must end in `.js` even though source files are `.ts`. ESM/NodeNext requirement — do not remove extensions.
 - `out/`, `.env`, `node_modules/`, and `*.log` are gitignored. Never commit them.
+- The Cloudflare Tunnel must be running on Hetzner before the daily cron fires, otherwise step 7 (assemble) will fail and retry.

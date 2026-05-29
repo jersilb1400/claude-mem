@@ -1,0 +1,15 @@
+{
+  "name": "bible-story-studio-worker",
+  "private": true,
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "typecheck": "tsc --noEmit",
+    "schema": "wrangler d1 execute bible-videos-series-memory --file schema.sql --remote"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250525.0",
+    "typescript": "^5.8.3",
+    "wrangler": "^4.13.2"
+  }
+}

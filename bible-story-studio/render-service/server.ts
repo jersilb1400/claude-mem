@@ -50,4 +50,11 @@ app.post("/assemble", async (c) => {
 });
 
 console.log(`Bible Render Service listening on :${PORT}`);
-export default { port: PORT, fetch: app.fetch };
+
+const server = Bun.serve({ port: PORT, fetch: app.fetch });
+
+// Graceful shutdown for PM2 SIGTERM
+process.on("SIGTERM", () => {
+  console.log("SIGTERM received — draining connections...");
+  server.stop(true);
+});
