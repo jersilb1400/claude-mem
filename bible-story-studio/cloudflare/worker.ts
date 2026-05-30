@@ -41,6 +41,7 @@ export interface Env {
   RESEND_API_KEY?: string;        // Feature 7: weekly digest email
   DIGEST_EMAIL?: string;          // Feature 7: recipient address
   QUALITY_GATE_ENABLED?: string;  // Feature 8: "true" to LLM-score before publish
+  IDEOGRAM_API_KEY?: string;      // Optional: Ideogram v3 for character-consistent keyframes (falls back to Flux 2)
 }
 
 interface Params {
@@ -530,6 +531,59 @@ async function sendWeeklyDigest(env: Env): Promise<void> {
   }).catch(() => {});
 }
 
+// ─── Ideogram Character API ───────────────────────────────────────────────────
+
+/**
+ * Generates a keyframe image using Ideogram v3.
+ * Endpoint: POST https://api.ideogram.ai/v1/ideogram-v3/generate
+ * Auth: `Api-Key` header (no Bearer prefix).
+ * Content-Type: multipart/form-data (required when passing character_reference_images).
+ * Image URL in response is ephemeral — downloaded immediately.
+ *
+ * @param characterRefBytes  PNG bytes of the character portrait to lock identity.
+ *                           Pass undefined for first-time reference generation.
+ */
+async function ideogramKeyframe(
+  apiKey: string,
+  prompt: string,
+  aspectRatio: "16:9" | "9:16" | "1:1",
+  characterRefBytes?: ArrayBuffer,
+): Promise<ArrayBuffer> {
+  const form = new FormData();
+  form.append("prompt", prompt);
+  form.append("aspect_ratio", aspectRatio);
+  form.append("style_type", "FICTION");       // Best for cartoon/illustrated children's content
+  form.append("rendering_speed", "TURBO");    // ~$0.04/image; fastest
+  form.append("image_count", "1");
+  form.append("negative_prompt", "realistic photograph, violent, scary, dark, adult content, text overlay, watermark");
+
+  if (characterRefBytes) {
+    // multipart field name confirmed from ComfyUI-DP-Ideogram-Character source + official docs
+    form.append(
+      "character_reference_images",
+      new Blob([characterRefBytes], { type: "image/png" }),
+      "character.png",
+    );
+  }
+
+  // Do NOT manually set Content-Type — runtime sets it with multipart boundary automatically
+  const res = await fetch("https://api.ideogram.ai/v1/ideogram-v3/generate", {
+    method: "POST",
+    headers: { "Api-Key": apiKey },
+    body: form,
+  });
+  if (!res.ok) throw new Error(`Ideogram ${res.status}: ${await res.text()}`);
+
+  const data = (await res.json()) as { data?: Array<{ url?: string }> };
+  const url = data.data?.[0]?.url;
+  if (!url) throw new Error("Ideogram returned no image URL");
+
+  // URL is ephemeral (signed, time-limited) — must download immediately
+  const imgRes = await fetch(url);
+  if (!imgRes.ok) throw new Error(`Ideogram CDN ${imgRes.status}`);
+  return imgRes.arrayBuffer();
+}
+
 // ─── CORS helper ─────────────────────────────────────────────────────────────
 
 function corsHeaders(): HeadersInit {
@@ -628,11 +682,41 @@ export class StudioWorkflow extends WorkflowEntrypoint<Env, Params> {
         if (!v.safe) throw new Error(`Safety blocked: ${v.reason}`);
       });
 
-      // ── 3. Keyframes (Flux 2) ────────────────────────────────────────────────
-      const imageKeys = await step.do(
+      // ── 3. Keyframes (Ideogram v3 character-consistent, or Flux 2 fallback) ───
+      const keyframeResult = await step.do(
         "keyframes",
         { retries: { limit: 3, delay: "15 seconds", backoff: "exponential" } },
         async () => {
+          const useIdeogram = !!this.env.IDEOGRAM_API_KEY;
+          const refKeysRecord: Record<string, string> = {};       // charName → new R2 ref key
+          const charRefCache = new Map<string, ArrayBuffer>();    // charName → portrait bytes
+
+          if (useIdeogram) {
+            // Phase 1: ensure every character has a reference portrait
+            for (const character of story.characters) {
+              const charRow = await this.env.SERIES_MEMORY
+                .prepare("SELECT reference_sheet_key FROM characters WHERE name = ?")
+                .bind(character.name)
+                .first<{ reference_sheet_key: string | null }>();
+
+              if (charRow?.reference_sheet_key) {
+                // Load existing reference from R2
+                const refObj = await this.env.ARTIFACTS.get(charRow.reference_sheet_key);
+                if (refObj) charRefCache.set(character.name, await refObj.arrayBuffer());
+              } else {
+                // Generate a clean reference portrait (no character ref yet — this IS the reference)
+                const refPrompt = `Full-body character portrait, flat-vector cartoon illustration for young children, soft pastel colors, neutral off-white background, single character only, no background scene, no other characters. Character: ${character.name} — ${character.description}. Exact color palette: skin tone ${character.palette.skin}, hair ${character.palette.hair}, clothing/robe ${character.palette.robe}. Character design reference sheet style, consistent and reproducible.`;
+                const refBytes = await ideogramKeyframe(this.env.IDEOGRAM_API_KEY!, refPrompt, "1:1");
+                const safeName = character.name.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+                const refKey = `characters/${safeName}/reference.png`;
+                await r2Put(this.env.ARTIFACTS, refKey, refBytes, "image/png");
+                charRefCache.set(character.name, refBytes);
+                refKeysRecord[character.name] = refKey;
+              }
+            }
+          }
+
+          // Phase 2: generate each scene keyframe
           const keys: string[] = [];
           for (let i = 0; i < story.scenes.length; i++) {
             const scene = story.scenes[i]!;
@@ -640,26 +724,46 @@ export class StudioWorkflow extends WorkflowEntrypoint<Env, Params> {
               .filter((c) => scene.characters.includes(c.name))
               .map((c) => `${c.name}: ${c.description}, palette ${JSON.stringify(c.palette)}`)
               .join("; ");
-            const prompt = `Cute flat-vector cartoon for preschoolers, soft pastel colors, friendly rounded shapes, big eyes. ${scene.visual}. Characters — ${cast}. Setting: ${scene.setting}. No text overlays.`;
-            const res = await fetch("https://fal.run/fal-ai/flux-2", {
-              method: "POST",
-              headers: { Authorization: `Key ${this.env.FAL_API_KEY}`, "Content-Type": "application/json" },
-              body: JSON.stringify({ prompt, image_size: { width: 1920, height: 1080 } }),
-            });
-            if (!res.ok) throw new Error(`Flux2 ${res.status}: ${await res.text()}`);
-            const data = (await res.json()) as { images?: { url: string }[] };
-            const url = data.images?.[0]?.url;
-            if (!url) throw new Error("Flux2 returned no image");
-            const img = await (await fetch(url)).arrayBuffer();
+            const scenePrompt = `Cute flat-vector cartoon for preschoolers, soft pastel colors, friendly rounded shapes, big expressive eyes. ${scene.visual}. Characters — ${cast}. Setting: ${scene.setting}. No text overlays. Safe and cheerful for young children.`;
+
+            let imgBytes: ArrayBuffer;
+            if (useIdeogram) {
+              // Primary character = first named character in scene that has a cached reference
+              const primaryRef = scene.characters
+                .map((n) => charRefCache.get(n))
+                .find((b): b is ArrayBuffer => b != null);
+              imgBytes = await ideogramKeyframe(this.env.IDEOGRAM_API_KEY!, scenePrompt, "16:9", primaryRef);
+            } else {
+              // Fallback: Flux 2
+              const res = await fetch("https://fal.run/fal-ai/flux-2", {
+                method: "POST",
+                headers: { Authorization: `Key ${this.env.FAL_API_KEY}`, "Content-Type": "application/json" },
+                body: JSON.stringify({ prompt: scenePrompt, image_size: { width: 1920, height: 1080 } }),
+              });
+              if (!res.ok) throw new Error(`Flux2 ${res.status}: ${await res.text()}`);
+              const data = (await res.json()) as { images?: { url: string }[] };
+              const url = data.images?.[0]?.url;
+              if (!url) throw new Error("Flux2 returned no image");
+              imgBytes = await (await fetch(url)).arrayBuffer();
+            }
+
             const key = `${id}/images/scene-${String(i).padStart(2, "0")}.png`;
-            await r2Put(this.env.ARTIFACTS, key, img, "image/png");
+            await r2Put(this.env.ARTIFACTS, key, imgBytes, "image/png");
             keys.push(key);
           }
-          return keys;
+
+          return { imageKeys: keys, characterRefKeys: refKeysRecord, usedIdeogram: useIdeogram };
         },
       );
+      const { imageKeys, characterRefKeys, usedIdeogram } = keyframeResult;
 
-      await logCost(this.env, id, "keyframes", "fal-flux2", imageKeys.length, "images", 0.05);
+      await logCost(
+        this.env, id, "keyframes",
+        usedIdeogram ? "ideogram" : "fal-flux2",
+        imageKeys.length + Object.keys(characterRefKeys).length,
+        "images",
+        usedIdeogram ? 0.04 : 0.05,
+      );
 
       // ── 4. Animation (PixVerse V4.5) ─────────────────────────────────────────
       const clipKeys = await step.do(
@@ -798,15 +902,17 @@ export class StudioWorkflow extends WorkflowEntrypoint<Env, Params> {
           .bind(topic)
           .run();
 
-        // Feature 3: Series continuity — upsert characters with last appearance
+        // Series continuity — upsert characters, persist reference portrait keys across episodes
         for (const c of story.characters) {
+          const refKey = characterRefKeys[c.name] ?? null;
           await this.env.SERIES_MEMORY
-            .prepare(`INSERT INTO characters (id, name, description, palette_skin, palette_hair, palette_robe, last_episode_id, last_seen_at)
-                      VALUES (?, ?, ?, ?, ?, ?, ?, unixepoch())
+            .prepare(`INSERT INTO characters (id, name, description, palette_skin, palette_hair, palette_robe, reference_sheet_key, last_episode_id, last_seen_at)
+                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
                       ON CONFLICT(name) DO UPDATE SET
-                        last_episode_id = excluded.last_episode_id,
-                        last_seen_at    = excluded.last_seen_at`)
-            .bind(crypto.randomUUID(), c.name, c.description, c.palette.skin, c.palette.hair, c.palette.robe, id)
+                        last_episode_id     = excluded.last_episode_id,
+                        last_seen_at        = excluded.last_seen_at,
+                        reference_sheet_key = COALESCE(excluded.reference_sheet_key, characters.reference_sheet_key)`)
+            .bind(crypto.randomUUID(), c.name, c.description, c.palette.skin, c.palette.hair, c.palette.robe, refKey, id)
             .run()
             .catch(() => {});
           const charRow = await this.env.SERIES_MEMORY
@@ -955,10 +1061,27 @@ export class ShortsWorkflow extends WorkflowEntrypoint<Env, ShortsParams> {
       const shortScenes = story.scenes.slice(0, 3);
       const shortStory: StoryOutput = { ...story, scenes: shortScenes };
 
-      const imageKeys = await step.do(
+      // Portrait keyframes — Ideogram 9:16 with same character reference lookup
+      const shortImageKeys = await step.do(
         "keyframes",
         { retries: { limit: 3, delay: "15 seconds", backoff: "exponential" } },
         async () => {
+          const useIdeogram = !!this.env.IDEOGRAM_API_KEY;
+          const charRefCache = new Map<string, ArrayBuffer>();
+
+          if (useIdeogram) {
+            for (const character of shortStory.characters) {
+              const charRow = await this.env.SERIES_MEMORY
+                .prepare("SELECT reference_sheet_key FROM characters WHERE name = ?")
+                .bind(character.name)
+                .first<{ reference_sheet_key: string | null }>();
+              if (charRow?.reference_sheet_key) {
+                const refObj = await this.env.ARTIFACTS.get(charRow.reference_sheet_key);
+                if (refObj) charRefCache.set(character.name, await refObj.arrayBuffer());
+              }
+            }
+          }
+
           const keys: string[] = [];
           for (let i = 0; i < shortScenes.length; i++) {
             const scene = shortScenes[i]!;
@@ -966,24 +1089,35 @@ export class ShortsWorkflow extends WorkflowEntrypoint<Env, ShortsParams> {
               .filter((c) => scene.characters.includes(c.name))
               .map((c) => `${c.name}: ${c.description}, palette ${JSON.stringify(c.palette)}`)
               .join("; ");
-            const prompt = `Cute flat-vector cartoon for preschoolers, soft pastel colors, PORTRAIT orientation for YouTube Shorts. ${scene.visual}. Characters — ${cast}. Setting: ${scene.setting}. No text overlays.`;
-            const res = await fetch("https://fal.run/fal-ai/flux-2", {
-              method: "POST",
-              headers: { Authorization: `Key ${this.env.FAL_API_KEY}`, "Content-Type": "application/json" },
-              body: JSON.stringify({ prompt, image_size: { width: 1080, height: 1920 } }),
-            });
-            if (!res.ok) throw new Error(`Flux2 ${res.status}: ${await res.text()}`);
-            const data = (await res.json()) as { images?: { url: string }[] };
-            const url = data.images?.[0]?.url;
-            if (!url) throw new Error("Flux2 returned no image");
-            const img = await (await fetch(url)).arrayBuffer();
+            const scenePrompt = `Cute flat-vector cartoon for preschoolers, soft pastel colors, PORTRAIT orientation for YouTube Shorts. ${scene.visual}. Characters — ${cast}. Setting: ${scene.setting}. No text overlays. Safe and cheerful for young children.`;
+
+            let imgBytes: ArrayBuffer;
+            if (useIdeogram) {
+              const primaryRef = scene.characters
+                .map((n) => charRefCache.get(n))
+                .find((b): b is ArrayBuffer => b != null);
+              imgBytes = await ideogramKeyframe(this.env.IDEOGRAM_API_KEY!, scenePrompt, "9:16", primaryRef);
+            } else {
+              const res = await fetch("https://fal.run/fal-ai/flux-2", {
+                method: "POST",
+                headers: { Authorization: `Key ${this.env.FAL_API_KEY}`, "Content-Type": "application/json" },
+                body: JSON.stringify({ prompt: scenePrompt, image_size: { width: 1080, height: 1920 } }),
+              });
+              if (!res.ok) throw new Error(`Flux2 ${res.status}: ${await res.text()}`);
+              const data = (await res.json()) as { images?: { url: string }[] };
+              const url = data.images?.[0]?.url;
+              if (!url) throw new Error("Flux2 returned no image");
+              imgBytes = await (await fetch(url)).arrayBuffer();
+            }
+
             const key = `${id}/shorts/images/scene-${String(i).padStart(2, "0")}.png`;
-            await r2Put(this.env.ARTIFACTS, key, img, "image/png");
+            await r2Put(this.env.ARTIFACTS, key, imgBytes, "image/png");
             keys.push(key);
           }
           return keys;
         },
       );
+      const imageKeys = shortImageKeys;
 
       const clipKeys = await step.do(
         "animate",

@@ -58,6 +58,7 @@ set_secret "PUBLISH_WEBHOOK"        "optional — outgoing webhook URL fired aft
 set_secret "RESEND_API_KEY"         "optional — Resend API key for weekly email digest"
 set_secret "DIGEST_EMAIL"           "optional — recipient email address for weekly digest"
 set_secret "QUALITY_GATE_ENABLED"   "optional — set to 'true' to LLM-score episodes before publish"
+set_secret "IDEOGRAM_API_KEY"       "optional — Ideogram v3 character-consistent keyframes (falls back to Flux 2 if unset)"
 
 echo "╔══════════════════════════════════════════╗"
 echo "║  ✅  Secrets setup complete!             ║"

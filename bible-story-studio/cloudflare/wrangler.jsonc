@@ -72,5 +72,6 @@
   //   RESEND_API_KEY       — optional: Resend API key for weekly email digest
   //   DIGEST_EMAIL         — optional: recipient email for weekly digest
   //   QUALITY_GATE_ENABLED — optional: set to "true" to LLM-score episodes before publish
+  //   IDEOGRAM_API_KEY     — optional: Ideogram v3 for character-consistent keyframes; falls back to Flux 2 if unset
   "vars": {}
 }
