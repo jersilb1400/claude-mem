@@ -2,7 +2,7 @@
 #
 # Base layout mirrors anthropics/claude-code .devcontainer
 # (https://github.com/anthropics/claude-code/blob/main/.devcontainer/Dockerfile):
-#   FROM node:20, non-root `node` user, global npm install of @anthropic-ai/claude-code.
+#   FROM node:22, non-root `node` user, global npm install of @anthropic-ai/claude-code.
 # We skip the firewall/zsh/fzf/delta/git-hist noise since this image is for
 # exercising claude-mem, not as a full dev environment.
 #
@@ -19,7 +19,7 @@
 #     -v /path/to/extracted/creds.json:/auth/.credentials.json:ro \
 #     claude-mem:basic
 
-FROM node:20
+FROM node:22.23.4
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -34,6 +34,7 @@ RUN apt-get update \
       procps \
       uuid-runtime \
       sqlite3 \
+ && apt-get upgrade -y --no-install-recommends ca-certificates \
  && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Bun — system-wide so the unprivileged `node` user can execute it.
